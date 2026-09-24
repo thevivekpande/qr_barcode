@@ -55,7 +55,9 @@ npm test
 npm run test:e2e
 ```
 
-The build is emitted to `dist/`. Configure your static host to serve `index.html` for `/single`, `/live`, `/batch`, and `/scan`, preserving the query string, so direct links and reloads work. Vite’s development and preview servers provide this fallback automatically. `npm run preview` serves the production build locally. Clipboard and camera access require HTTPS or localhost.
+The build is emitted to `dist/`. The included `vercel.json` sets the Vite build command/output and rewrites application routes to `index.html`, so direct links and reloads work on Vercel while preserving the browser URL and its state. Deploy from the repository root; commit and push changes to this configuration to trigger a new deployment in a Git-connected Vercel project. Existing deployments must be redeployed before a routing fix takes effect.
+
+For other static hosts, configure the same `index.html` fallback for `/single`, `/live`, `/batch`, and `/scan`, preserving the query string. Vite’s development and preview servers provide this fallback automatically. `npm run preview` serves the production build locally. Clipboard and camera access require HTTPS or localhost.
 
 Unit tests cover batch parsing, QR/barcode generation and decoding, image validation, URL state round trips, escaping, randomness, and color contrast. Browser tests cover generation, image scanning, simulated camera decoding and resource cleanup, share links and reloads, downloads, timers, printing, and mobile layout; see `playwright.config.ts` for browser and server settings.
 
