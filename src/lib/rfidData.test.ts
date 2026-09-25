@@ -3,6 +3,19 @@ import { bytesToHex, bytesToText, createByteFramer, encodeCommand } from './rfid
 const encode = (value: string) => new TextEncoder().encode(value);
 
 describe('RFID stream framing', () => {
+  it('automatically handles line-delimited reads and flushes suffixless reads at idle', () => {
+    const framer = createByteFramer('auto');
+    expect(framer.push(encode('LINE\r\nNO-SUFFIX')).map(bytesToText)).toEqual(['LINE']);
+    expect(bytesToText(framer.flush()!)).toBe('NO-SUFFIX');
+    expect(framer.push(encode('\nNEXT\n')).map(bytesToText)).toEqual(['NEXT']);
+    expect(framer.flush()).toBeNull();
+  });
+  it('keeps explicit line framing pending until its terminator arrives', () => {
+    const framer = createByteFramer('lines');
+    expect(framer.push(encode('TAG'))).toEqual([]);
+    expect(framer.pendingBytes).toBe(3);
+    expect(framer.push(encode('\r\n')).map(bytesToText)).toEqual(['TAG']);
+  });
   it('assembles multiple and split CR/LF frames without duplicates or trimming', () => {
     const framer = createByteFramer('lines');
     expect(framer.push(encode('  001'))).toEqual([]);

@@ -49,6 +49,14 @@ type DeviceInfo = {
   vendorId?: number;
   productId?: number;
   outputReportIds?: number[];
+  inputReportIds?: number[];
+  supportsSignals?: boolean;
+};
+type LatestInput = {
+  bytes: Uint8Array;
+  total: number;
+  source: 'hid' | 'serial';
+  reportId?: number;
 };
 const BAUD_RATES = [1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600];
 
@@ -77,6 +85,14 @@ export default function RfidLab({
   const [reportId, setReportId] = useState('0');
   const [sending, setSending] = useState(false);
   const [memoryState, setMemoryState] = useState<MemoryState>({ phase: 'idle', message: '' });
+  const [latestInput, setLatestInput] = useState<LatestInput | null>(null);
+  const [readerValue, setReaderValue] = useState<
+    { bytes: Uint8Array; description: string } | undefined
+  >();
+  const [waitingForInput, setWaitingForInput] = useState(false);
+  const [dtr, setDtr] = useState('unchanged');
+  const [rts, setRts] = useState('unchanged');
+  const [applyingSignals, setApplyingSignals] = useState(false);
   const [copied, setCopied] = useState('');
   const [customBaud, setCustomBaud] = useState(!BAUD_RATES.includes(settings.baudRate));
   const mounted = useRef(false);
@@ -142,8 +158,23 @@ export default function RfidLab({
       reportId: id,
     };
     setEntries((previous) => [entry, ...previous].slice(0, 100));
-    if (direction === 'received') setReceived((value) => value + 1);
-    else setSent((value) => value + 1);
+    if (direction === 'received') {
+      setReceived((value) => value + 1);
+      if (source !== 'keyboard')
+        setReaderValue({
+          bytes: bytes.slice(),
+          description: source === 'hid' ? `HID input report ${id}` : 'Serial input frame',
+        });
+    } else setSent((value) => value + 1);
+  }
+  function observeInput(bytes: Uint8Array, source: 'hid' | 'serial', reportId?: number) {
+    setWaitingForInput(false);
+    setLatestInput({
+      bytes: bytes.slice(0, MAX_FRAME_BYTES),
+      total: bytes.length,
+      source,
+      reportId,
+    });
   }
   function commitKeyboard() {
     if (
@@ -211,6 +242,7 @@ export default function RfidLab({
       if (next === 'disconnected') {
         setDevice(null);
         setSending(false);
+        setApplyingSignals(false);
         resetFraming();
         operation.current++;
       }
@@ -229,6 +261,7 @@ export default function RfidLab({
       onInfo,
       onData: (bytes, id) => {
         if (!mounted.current) return;
+        observeInput(bytes, 'hid', id);
         if (memoryTarget.current.transport === 'hid' && memoryTarget.current.inputReportId === id)
           memory.receive(bytes);
         setReceivedBytes((value) => value + bytes.length);
@@ -239,15 +272,22 @@ export default function RfidLab({
       onStatus,
       onError,
       onInfo,
+      onReadError: (message) => {
+        if (!mounted.current) return;
+        resetFraming();
+        memory.cancel('A serial read error interrupted the memory response.');
+        setNotice(message);
+      },
       onData: (bytes) => {
         if (!mounted.current) return;
+        observeInput(bytes, 'serial');
         if (memoryTarget.current.transport === 'serial') memory.receive(bytes);
         setReceivedBytes((value) => value + bytes.length);
         for (const frame of framer.current.push(bytes)) record(frame, 'serial', 'received');
         setPending(framer.current.pendingBytes);
         if (framer.current.takeOverflow())
           setError('A frame exceeded 4,096 bytes and was discarded. Check the receive framing.');
-        if (settingsRef.current.framing === 'idle') {
+        if (settingsRef.current.framing === 'idle' || settingsRef.current.framing === 'auto') {
           if (serialTimer.current) clearTimeout(serialTimer.current);
           serialTimer.current = setTimeout(() => {
             const frame = framer.current.flush();
@@ -289,6 +329,12 @@ export default function RfidLab({
     if (listening) readerInput.current?.focus();
   }, [listening]);
   useEffect(() => {
+    setWaitingForInput(false);
+    if (status !== 'connected' || latestInput) return;
+    const timer = setTimeout(() => setWaitingForInput(true), 5000);
+    return () => clearTimeout(timer);
+  }, [status, latestInput]);
+  useEffect(() => {
     if (!copied) return;
     const timer = setTimeout(() => setCopied(''), 1800);
     return () => clearTimeout(timer);
@@ -300,14 +346,17 @@ export default function RfidLab({
     setNotice('');
     setDevice(null);
     setMemoryState({ phase: 'idle', message: '' });
+    setLatestInput(null);
+    setReaderValue(undefined);
     resetInput();
     resetFraming();
     onSettingsChange({ ...settings, ...patch });
   }
   function validSettings() {
     if (
-      ((keyboard && settings.terminator === 'idle') ||
-        (settings.transport === 'serial' && settings.framing === 'idle')) &&
+      ((keyboard && (settings.terminator === 'idle' || settings.terminator === 'auto')) ||
+        (settings.transport === 'serial' &&
+          (settings.framing === 'idle' || settings.framing === 'auto'))) &&
       (!Number.isSafeInteger(settings.idleMs) || settings.idleMs < 50 || settings.idleMs > 2000)
     ) {
       setError('Set the idle gap between 50 and 2,000 milliseconds.');
@@ -329,6 +378,10 @@ export default function RfidLab({
     setError('');
     setNotice('');
     setMemoryState({ phase: 'idle', message: '' });
+    setLatestInput(null);
+    setReaderValue(undefined);
+    setDtr('unchanged');
+    setRts('unchanged');
     resetFraming();
     framer.current = createByteFramer(settings.framing);
     operation.current++;
@@ -343,8 +396,52 @@ export default function RfidLab({
     resetFraming();
     await Promise.all([hid.current?.disconnect(), serial.current?.disconnect()]);
   }
+  async function testKeyboardInput() {
+    if (memorySession.current?.busy || sending || applyingSignals) return;
+    await disconnect();
+    if (!mounted.current || connectionStatus.current !== 'disconnected') return;
+    const next: RfidSettings = {
+      ...settingsRef.current,
+      transport: 'hid',
+      hidMode: 'keyboard',
+      terminator: 'auto',
+      idleMs: Math.max(50, Math.min(2000, settingsRef.current.idleMs || 150)),
+    };
+    settingsRef.current = next;
+    onSettingsChange(next);
+    setMemoryState({ phase: 'idle', message: '' });
+    setLatestInput(null);
+    setReaderValue(undefined);
+    setError('');
+    setNotice('Keyboard test started. Keep Reader input focused, then present a tag.');
+    resetInput();
+    keyboardActive.current = true;
+    setListening(true);
+  }
+  async function applySignals() {
+    if (status !== 'connected' || sending || applyingSignals || memorySession.current?.busy) return;
+    const token = operation.current;
+    setError('');
+    setApplyingSignals(true);
+    try {
+      const signals: { dataTerminalReady?: boolean; requestToSend?: boolean } = {};
+      if (dtr !== 'unchanged') signals.dataTerminalReady = dtr === 'high';
+      if (rts !== 'unchanged' && settings.flowControl !== 'hardware')
+        signals.requestToSend = rts === 'high';
+      await serial.current!.setSignals(signals);
+      if (mounted.current && token === operation.current)
+        setNotice('Serial line signals applied. Present a tag to check input.');
+    } catch (cause) {
+      if (mounted.current && token === operation.current)
+        setError(
+          cause instanceof Error ? cause.message : 'Could not apply the serial line signals.',
+        );
+    } finally {
+      if (mounted.current && token === operation.current) setApplyingSignals(false);
+    }
+  }
   async function send() {
-    if (sending || memorySession.current?.busy || status !== 'connected') return;
+    if (sending || applyingSignals || memorySession.current?.busy || status !== 'connected') return;
     setError('');
     const token = operation.current;
     const source = settings.transport;
@@ -369,13 +466,25 @@ export default function RfidLab({
     }
   }
   function readMemory(profile: MemoryProfile, reports: MemoryReports) {
-    if (sending || memorySession.current?.busy || connectionStatus.current !== 'connected') return;
+    if (
+      sending ||
+      applyingSignals ||
+      memorySession.current?.busy ||
+      connectionStatus.current !== 'connected'
+    )
+      return;
     setError('');
     memoryTarget.current = { transport: settings.transport, ...reports };
     void memorySession.current?.read(profile);
   }
   function writeMemory(profile: MemoryProfile, bytes: Uint8Array, reports: MemoryReports) {
-    if (sending || memorySession.current?.busy || connectionStatus.current !== 'connected') return;
+    if (
+      sending ||
+      applyingSignals ||
+      memorySession.current?.busy ||
+      connectionStatus.current !== 'connected'
+    )
+      return;
     setError('');
     memoryTarget.current = { transport: settings.transport, ...reports };
     void memorySession.current?.writeAndVerify(profile, bytes);
@@ -395,6 +504,8 @@ export default function RfidLab({
     setReceived(0);
     setReceivedBytes(0);
     setSent(0);
+    setLatestInput(null);
+    setReaderValue(undefined);
     setError('');
   }
   function exportLog() {
@@ -410,8 +521,9 @@ export default function RfidLab({
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
   const idleControl =
-    (settings.transport === 'serial' && settings.framing === 'idle') ||
-    (keyboard && settings.terminator === 'idle');
+    (settings.transport === 'serial' &&
+      (settings.framing === 'idle' || settings.framing === 'auto')) ||
+    (keyboard && (settings.terminator === 'idle' || settings.terminator === 'auto'));
   const statusLabel = keyboard
     ? listening
       ? focused
@@ -498,6 +610,7 @@ export default function RfidLab({
                           update({ terminator: event.target.value as RfidSettings['terminator'] })
                         }
                       >
+                        <option value="auto">Automatic (Enter, Tab, or idle gap)</option>
                         <option value="enter">Enter key</option>
                         <option value="tab">Tab key</option>
                         <option value="idle">Idle gap (no suffix)</option>
@@ -602,6 +715,7 @@ export default function RfidLab({
                         update({ framing: event.target.value as RfidSettings['framing'] })
                       }
                     >
+                      <option value="auto">Automatic (line ending or idle gap)</option>
                       <option value="lines">Lines (CR / LF / CRLF)</option>
                       <option value="idle">Idle gap</option>
                       <option value="chunks">Raw chunks</option>
@@ -689,7 +803,7 @@ export default function RfidLab({
                         inputValue.current = value;
                         setInput(value);
                       }
-                      if (settings.terminator === 'idle') {
+                      if (settings.terminator === 'idle' || settings.terminator === 'auto') {
                         if (keyboardTimer.current) clearTimeout(keyboardTimer.current);
                         keyboardTimer.current = setTimeout(commitKeyboard, settings.idleMs);
                       }
@@ -701,8 +815,9 @@ export default function RfidLab({
                         return;
                       }
                       if (
-                        (settings.terminator === 'enter' && event.key === 'Enter') ||
-                        (settings.terminator === 'tab' &&
+                        ((settings.terminator === 'enter' || settings.terminator === 'auto') &&
+                          event.key === 'Enter') ||
+                        ((settings.terminator === 'tab' || settings.terminator === 'auto') &&
                           event.key === 'Tab' &&
                           !event.shiftKey &&
                           (inputValue.current.length > 0 || keyboardOverflow.current))
@@ -714,9 +829,15 @@ export default function RfidLab({
                   />
                 </label>
                 {listening && !focused && (
-                  <button className="text-button" onClick={() => readerInput.current?.focus()}>
-                    Focus reader input
-                  </button>
+                  <div className="rfid-support" role="status">
+                    <p>
+                      Capture is paused while Reader input is unfocused. Refocus it before scanning
+                      a tag.
+                    </p>
+                    <button className="text-button" onClick={() => readerInput.current?.focus()}>
+                      Focus reader input
+                    </button>
+                  </div>
                 )}
                 <p className="rfid-hint">
                   Capture runs only in this focused field. Keyboard readers cannot be identified or
@@ -758,6 +879,109 @@ export default function RfidLab({
                 <p className="rfid-hint rfid-connect-hint">
                   Choose your reader in the browser’s device picker. Nothing is sent on connection.
                 </p>
+                {settings.transport === 'hid' && (
+                  <div className="rfid-hid-help">
+                    <p className="rfid-hint">
+                      Some readers use raw HID for configuration and type tag values through their
+                      keyboard interface.
+                    </p>
+                    <button
+                      className="secondary-button"
+                      disabled={
+                        status === 'requesting' ||
+                        status === 'connecting' ||
+                        status === 'disconnecting' ||
+                        sending ||
+                        memoryActive
+                      }
+                      onClick={() => void testKeyboardInput()}
+                    >
+                      <Keyboard size={15} />
+                      Test keyboard input
+                    </button>
+                  </div>
+                )}
+                {waitingForInput && (
+                  <p className="rfid-support" role="status">
+                    No input received yet.{' '}
+                    {settings.transport === 'serial'
+                      ? 'Check the selected port and the reader’s baud rate and flow control. Some readers also require line signals or a documented polling command.'
+                      : 'Try Test keyboard input if scanning types text. A raw HID connection alone does not start reading tags; some devices need a documented command.'}
+                  </p>
+                )}
+                {device?.inputReportIds && (
+                  <p className="rfid-hint rfid-reports">
+                    Input report IDs:{' '}
+                    {device.inputReportIds.length
+                      ? device.inputReportIds.join(', ')
+                      : 'none declared'}
+                    . Output report IDs:{' '}
+                    {device.outputReportIds?.length
+                      ? device.outputReportIds.join(', ')
+                      : 'none declared'}
+                    .
+                  </p>
+                )}
+                {settings.transport === 'serial' &&
+                  status === 'connected' &&
+                  device?.supportsSignals && (
+                    <details className="rfid-signals">
+                      <summary>Serial line signals</summary>
+                      <p className="rfid-hint">
+                        Use these only when required by your reader. Changing DTR or RTS can change
+                        its operating mode. The app leaves both unchanged on connection.
+                      </p>
+                      <div className="rfid-fields">
+                        <label className="rfid-field">
+                          DTR
+                          <select
+                            aria-label="DTR"
+                            value={dtr}
+                            onChange={(event) => setDtr(event.target.value)}
+                            disabled={sending || memoryActive || applyingSignals}
+                          >
+                            <option value="unchanged">Leave unchanged</option>
+                            <option value="high">High (assert)</option>
+                            <option value="low">Low (deassert)</option>
+                          </select>
+                        </label>
+                        <label className="rfid-field">
+                          RTS
+                          <select
+                            aria-label="RTS"
+                            value={rts}
+                            onChange={(event) => setRts(event.target.value)}
+                            disabled={
+                              sending ||
+                              memoryActive ||
+                              applyingSignals ||
+                              settings.flowControl === 'hardware'
+                            }
+                          >
+                            <option value="unchanged">Leave unchanged</option>
+                            <option value="high">High (assert)</option>
+                            <option value="low">Low (deassert)</option>
+                          </select>
+                        </label>
+                      </div>
+                      {settings.flowControl === 'hardware' && (
+                        <p className="rfid-hint">RTS is managed by hardware flow control.</p>
+                      )}
+                      <button
+                        className="secondary-button"
+                        onClick={() => void applySignals()}
+                        disabled={
+                          sending ||
+                          memoryActive ||
+                          applyingSignals ||
+                          (dtr === 'unchanged' &&
+                            (rts === 'unchanged' || settings.flowControl === 'hardware'))
+                        }
+                      >
+                        {applyingSignals ? 'Applying…' : 'Apply line signals'}
+                      </button>
+                    </details>
+                  )}
               </>
             )}
           </div>
@@ -801,11 +1025,15 @@ export default function RfidLab({
             <span>
               {entries.length
                 ? `Latest ${entries.length} / 100 entries`
-                : 'Waiting for your first read'}
+                : latestInput
+                  ? 'Raw input received'
+                  : 'Waiting for your first read'}
               {pending > 0 && (
                 <small>
                   {pending} bytes waiting for{' '}
-                  {settings.framing === 'idle' ? 'idle gap' : 'a line ending'}
+                  {settings.framing === 'idle' || settings.framing === 'auto'
+                    ? 'idle gap or line ending'
+                    : 'a line ending'}
                 </small>
               )}
             </span>
@@ -828,6 +1056,26 @@ export default function RfidLab({
               </button>
             </div>
           </div>
+          {latestInput && (
+            <details
+              className="rfid-raw-input"
+              open={entries.length === 0 ? true : undefined}
+              data-testid="rfid-last-input"
+            >
+              <summary>
+                Latest USB{' '}
+                {latestInput.source === 'hid' ? `report ${latestInput.reportId}` : 'chunk'} ·{' '}
+                {latestInput.total} bytes
+              </summary>
+              <pre>{bytesToText(latestInput.bytes) || '(empty report)'}</pre>
+              <code>{bytesToHex(latestInput.bytes) || '—'}</code>
+              <p>
+                Raw bytes before framing or memory decoding.
+                {latestInput.total > MAX_FRAME_BYTES &&
+                  ' Preview limited to the first 4,096 bytes.'}
+              </p>
+            </details>
+          )}
           <div
             className="rfid-log"
             data-testid="rfid-log"
@@ -839,11 +1087,21 @@ export default function RfidLab({
                 <div className="rfid-empty-icon">
                   <Radio size={33} strokeWidth={1.3} />
                 </div>
-                <h3>A tap starts the conversation.</h3>
+                <h3>
+                  {latestInput
+                    ? 'Input is reaching the app.'
+                    : status === 'connected'
+                      ? 'Reader connected. Ready for input.'
+                      : 'A tap starts the conversation.'}
+                </h3>
                 <p>
-                  {keyboard
-                    ? 'Start a keyboard test, focus the reader input, and present a tag.'
-                    : 'Connect your reader and present a tag. Readers that require polling need a command from their manual.'}
+                  {latestInput
+                    ? 'Your raw bytes are visible above. Use Automatic receive framing for readers that do not send a line ending.'
+                    : keyboard
+                      ? 'Start a keyboard test, focus the reader input, and present a tag.'
+                      : status === 'connected'
+                        ? 'Present a tag. Readers that require polling need a documented command before they send data.'
+                        : 'Connect your reader and present a tag. Readers that require polling need a command from their manual.'}
                 </p>
                 <span>TEXT · HEX · TIMESTAMP</span>
               </div>
@@ -917,8 +1175,10 @@ export default function RfidLab({
         keyboard={keyboard}
         transport={settings.transport}
         connected={status === 'connected'}
-        unavailable={sending}
+        unavailable={sending || applyingSignals}
+        inputReportIds={device?.inputReportIds ?? []}
         outputReportIds={device?.outputReportIds ?? []}
+        readerValue={readerValue}
         keyboardValue={
           entries.find((entry) => entry.source === 'keyboard' && entry.direction === 'received')
             ?.text
@@ -959,7 +1219,7 @@ export default function RfidLab({
                   }
                   rows={3}
                   maxLength={MAX_FRAME_BYTES * 3}
-                  disabled={sending || memoryActive}
+                  disabled={sending || memoryActive || applyingSignals}
                 />
               </label>
               <div className="rfid-fields">
@@ -969,7 +1229,7 @@ export default function RfidLab({
                     aria-label="Transmit format"
                     value={format}
                     onChange={(event) => setFormat(event.target.value as typeof format)}
-                    disabled={sending || memoryActive}
+                    disabled={sending || memoryActive || applyingSignals}
                   >
                     <option value="text">UTF-8 text</option>
                     <option value="hex">Hex bytes</option>
@@ -981,7 +1241,7 @@ export default function RfidLab({
                     aria-label="Line ending"
                     value={settings.transport === 'hid' ? 'none' : ending}
                     onChange={(event) => setEnding(event.target.value as typeof ending)}
-                    disabled={sending || memoryActive}
+                    disabled={sending || memoryActive || applyingSignals}
                   >
                     <option value="none">None</option>
                     {settings.transport === 'serial' && (
@@ -1002,7 +1262,7 @@ export default function RfidLab({
                       aria-label="Output report ID"
                       value={reportId}
                       onChange={(event) => setReportId(event.target.value)}
-                      disabled={sending || memoryActive}
+                      disabled={sending || memoryActive || applyingSignals}
                     />
                     <small>
                       {device
@@ -1026,6 +1286,7 @@ export default function RfidLab({
                   status !== 'connected' ||
                   sending ||
                   memoryActive ||
+                  applyingSignals ||
                   (settings.transport === 'hid' && !device?.outputReportIds?.length)
                 }
                 onClick={() => void send()}

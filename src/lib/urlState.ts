@@ -228,7 +228,13 @@ export function readWorkspaceUrl(url: URL): WorkspaceState {
     if (query.get('reader') === 'serial') r.transport = 'serial';
     if (query.get('hidMode') === 'raw') r.hidMode = 'raw';
     const terminator = query.get('terminator');
-    if (terminator === 'tab' || terminator === 'idle') r.terminator = terminator;
+    if (
+      terminator === 'auto' ||
+      terminator === 'enter' ||
+      terminator === 'tab' ||
+      terminator === 'idle'
+    )
+      r.terminator = terminator;
     r.idleMs = Number(readNumberDraft(query.get('idleMs'), String(r.idleMs), 50, 2000, true));
     r.baudRate = Number(
       readNumberDraft(query.get('baud'), String(r.baudRate), 50, 4_000_000, true),
@@ -239,7 +245,8 @@ export function readWorkspaceUrl(url: URL): WorkspaceState {
     if (parity === 'even' || parity === 'odd') r.parity = parity;
     if (query.get('flow') === 'hardware') r.flowControl = 'hardware';
     const framing = query.get('framing');
-    if (framing === 'idle' || framing === 'chunks') r.framing = framing;
+    if (framing === 'auto' || framing === 'lines' || framing === 'idle' || framing === 'chunks')
+      r.framing = framing;
   }
   return state;
 }

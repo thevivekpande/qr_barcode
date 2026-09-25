@@ -11,7 +11,9 @@ type Props = {
   transport: 'hid' | 'serial';
   connected: boolean;
   unavailable: boolean;
+  inputReportIds: number[];
   outputReportIds: number[];
+  readerValue?: { bytes: Uint8Array; description: string };
   keyboardValue?: string;
   state: MemoryState;
   onRead: (profile: MemoryProfile, reports: MemoryReports) => void;
@@ -33,7 +35,9 @@ export default function RfidMemory({
   transport,
   connected,
   unavailable,
+  inputReportIds,
   outputReportIds,
+  readerValue,
   keyboardValue,
   state,
   onRead,
@@ -43,14 +47,15 @@ export default function RfidMemory({
   const [profile, setProfile] = useState<MemoryProfile>({ ...INITIAL_PROFILE });
   const [value, setValue] = useState('');
   const [format, setFormat] = useState<'text' | 'hex'>('text');
-  const [inputReport, setInputReport] = useState('0');
+  const [inputReport, setInputReport] = useState('');
   const [outputReport, setOutputReport] = useState('');
   const [error, setError] = useState('');
   const [copied, setCopied] = useState(false);
   const active = ['reading', 'writing', 'verifying'].includes(state.phase);
   const disabled = active || unavailable;
   const selectedOutput = outputReport || String(outputReportIds[0] ?? 0);
-  const copySource = keyboard ? keyboardValue : state.value;
+  const selectedInput = inputReport || (inputReportIds.length ? String(inputReportIds[0]) : '');
+  const copySource = keyboard ? keyboardValue : (state.value ?? readerValue?.bytes);
   useEffect(() => {
     setCopied(false);
   }, [copySource]);
@@ -58,7 +63,7 @@ export default function RfidMemory({
     ? keyboardValue === undefined
       ? undefined
       : new TextEncoder().encode(keyboardValue)
-    : state.value;
+    : (state.value ?? readerValue?.bytes);
 
   function edit(patch: Partial<MemoryProfile>) {
     setProfile((previous) => ({ ...previous, ...patch }));
@@ -66,11 +71,11 @@ export default function RfidMemory({
   }
   function reports(): MemoryReports {
     if (transport === 'serial') return { inputReportId: 0, outputReportId: 0 };
-    if (!/^\d+$/.test(inputReport) || Number(inputReport) < 0 || Number(inputReport) > 255)
+    if (!/^\d+$/.test(selectedInput) || Number(selectedInput) < 0 || Number(selectedInput) > 255)
       throw new Error('Set the input report ID to a whole number from 0 to 255.');
     if (!/^\d+$/.test(selectedOutput) || !outputReportIds.includes(Number(selectedOutput)))
       throw new Error('Choose a memory output report ID declared by this HID reader.');
-    return { inputReportId: Number(inputReport), outputReportId: Number(selectedOutput) };
+    return { inputReportId: Number(selectedInput), outputReportId: Number(selectedOutput) };
   }
   function run(write: boolean) {
     if (!connected || disabled) return;
@@ -226,13 +231,18 @@ export default function RfidMemory({
                           type="number"
                           min="0"
                           max="255"
-                          value={inputReport}
+                          value={selectedInput}
                           onChange={(event) => {
                             setInputReport(event.target.value);
                             setError('');
                           }}
                         />
-                        <small>Only responses from this report are matched.</small>
+                        <small>
+                          {inputReportIds.length
+                            ? `Declared input IDs: ${inputReportIds.join(', ')}. Defaults to the first declared ID.`
+                            : 'Connect to discover input report IDs.'}{' '}
+                          Only responses from this report are matched.
+                        </small>
                       </label>
                       <label className="rfid-field">
                         Memory output report ID
@@ -382,7 +392,13 @@ export default function RfidMemory({
         {bytes !== undefined ? (
           <div className="rfid-memory-result">
             <div className="rfid-memory-result-title">
-              <span>{keyboard ? 'LAST CAPTURED VALUE' : 'LAST RETURNED VALUE'}</span>
+              <span>
+                {keyboard
+                  ? 'LAST CAPTURED VALUE'
+                  : state.value
+                    ? 'LAST RETURNED VALUE'
+                    : 'LATEST READER INPUT'}
+              </span>
               <button
                 className="text-button"
                 onClick={async () => {
@@ -400,7 +416,13 @@ export default function RfidMemory({
             </div>
             <pre data-testid="rfid-memory-value">{bytesToText(bytes)}</pre>
             <code data-testid="rfid-memory-hex">{bytesToHex(bytes)}</code>
-            {!keyboard && (
+            {!keyboard && !state.value && readerValue && (
+              <p className="rfid-hint">
+                {readerValue.description}. This is received reader data; it has not been decoded as
+                a memory response.
+              </p>
+            )}
+            {!keyboard && state.value && (
               <button
                 className="text-button"
                 disabled={disabled}

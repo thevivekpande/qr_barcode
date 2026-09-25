@@ -14,6 +14,14 @@ const read = (path: string) => readWorkspaceUrl(new URL(path, base));
 const roundTrip = (state: WorkspaceState) => read(buildWorkspaceUrl(state));
 
 describe('workspace URLs', () => {
+  it('defaults RFID capture to automatic framing and preserves explicitly chosen terminators', () => {
+    expect(read('/rfid').rfid).toMatchObject({ terminator: 'auto', framing: 'auto' });
+    for (const terminator of ['auto', 'enter', 'tab', 'idle'] as const) {
+      const state = read(`/rfid?terminator=${terminator}&framing=lines`);
+      expect(state.rfid).toMatchObject({ terminator, framing: 'lines' });
+      expect(roundTrip(state).rfid).toEqual(state.rfid);
+    }
+  });
   it('restores only RFID configuration without reconnecting or serializing reader data', () => {
     const state = createDefaultState();
     state.mode = 'rfid';

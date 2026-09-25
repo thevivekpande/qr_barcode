@@ -1,27 +1,27 @@
 export type RfidSettings = {
   transport: 'hid' | 'serial';
   hidMode: 'keyboard' | 'raw';
-  terminator: 'enter' | 'tab' | 'idle';
+  terminator: 'auto' | 'enter' | 'tab' | 'idle';
   idleMs: number;
   baudRate: number;
   dataBits: 7 | 8;
   stopBits: 1 | 2;
   parity: 'none' | 'even' | 'odd';
   flowControl: 'none' | 'hardware';
-  framing: 'lines' | 'idle' | 'chunks';
+  framing: 'auto' | 'lines' | 'idle' | 'chunks';
 };
 
 export const DEFAULT_RFID_SETTINGS: RfidSettings = {
   transport: 'hid',
   hidMode: 'keyboard',
-  terminator: 'enter',
+  terminator: 'auto',
   idleMs: 150,
   baudRate: 9600,
   dataBits: 8,
   stopBits: 1,
   parity: 'none',
   flowControl: 'none',
-  framing: 'lines',
+  framing: 'auto',
 };
 
 export const MAX_FRAME_BYTES = 4096;
@@ -81,7 +81,7 @@ export function createByteFramer(mode: RfidSettings['framing'], limit = MAX_FRAM
       }
       const frames: Uint8Array[] = [];
       for (const byte of bytes) {
-        if (mode === 'lines' && (byte === 10 || byte === 13)) {
+        if ((mode === 'lines' || mode === 'auto') && (byte === 10 || byte === 13)) {
           if (!(byte === 10 && afterCR) && !discarding && pending.length)
             frames.push(Uint8Array.from(pending));
           pending = [];

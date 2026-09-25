@@ -5,6 +5,7 @@ import type {
   SerialCallbacks,
   SerialDisconnectEvent,
   SerialOptions,
+  SerialOutputSignals,
   SerialPortLike,
 } from './rfidSerial';
 
@@ -66,6 +67,18 @@ function mockPort(
     enqueue: (value: Uint8Array) => input.enqueue(value),
     end: () => input.close(),
     fail: (error: Error) => input.error(error),
+    recover(error: Error) {
+      const previous = input;
+      const oldStream = port.readable;
+      port.readable = new ReadableStream<Uint8Array>({
+        start(controller) {
+          input = controller;
+        },
+        cancel: cancelled,
+      });
+      previous.error(error);
+      return { oldStream, replacement: port.readable };
+    },
   };
 }
 
@@ -184,6 +197,7 @@ describe('serial receive lifecycle', () => {
       name: 'USB serial reader (1234:ABCD)',
       vendorId: 0x1234,
       productId: 0xabcd,
+      supportsSignals: false,
     });
     expect(mock.port.readable?.locked).toBe(true);
     const first = new Uint8Array([0x00, 0xff, 0xe2]);
@@ -246,6 +260,198 @@ describe('serial receive lifecycle', () => {
     await test.reader.connect(settings);
     expect(test.callbacks.onStatus).toHaveBeenLastCalledWith('connected');
     await test.reader.disconnect();
+  });
+
+  it.each(['ParityError', 'FramingError', 'BufferOverrunError', 'BreakError'])(
+    'resumes incoming bytes on the replacement stream after %s',
+    async (name) => {
+      const mock = mockPort();
+      const test = harness(mock.port);
+      const interrupted = vi.fn();
+      test.callbacks.onReadError = interrupted;
+      await test.reader.connect(settings);
+      const streams = mock.recover(new DOMException('recoverable', name));
+      await vi.waitFor(() => expect(interrupted).toHaveBeenCalledOnce());
+      expect(streams.oldStream?.locked).toBe(false);
+      expect(streams.replacement.locked).toBe(true);
+      expect(mock.port.close).not.toHaveBeenCalled();
+      expect(test.callbacks.onStatus).toHaveBeenLastCalledWith('connected');
+      expect(test.callbacks.onError).not.toHaveBeenCalled();
+      mock.enqueue(new Uint8Array([0, 0xff, 0x0d]));
+      await vi.waitFor(() =>
+        expect(test.callbacks.onData).toHaveBeenCalledWith(new Uint8Array([0, 0xff, 0x0d])),
+      );
+      expect(mock.port.open).toHaveBeenCalledOnce();
+      expect(test.api.requestPort).toHaveBeenCalledOnce();
+      expect(mock.sent).toEqual([]);
+      await test.reader.disconnect();
+    },
+  );
+
+  it('bounds repeated recovery failures and never retries the same errored stream', async () => {
+    const mock = mockPort();
+    const test = harness(mock.port);
+    const interrupted = vi.fn();
+    test.callbacks.onReadError = interrupted;
+    await test.reader.connect(settings);
+    for (let index = 0; index < 4; index++) {
+      mock.recover(new DOMException('recoverable', 'FramingError'));
+      if (index < 3) await vi.waitFor(() => expect(interrupted).toHaveBeenCalledTimes(index + 1));
+    }
+    await vi.waitFor(() =>
+      expect(test.callbacks.onStatus).toHaveBeenLastCalledWith('disconnected'),
+    );
+    expect(interrupted).toHaveBeenCalledTimes(3);
+    expect(test.callbacks.onError).toHaveBeenLastCalledWith(
+      expect.stringContaining('repeatedly failed'),
+    );
+    expect(mock.port.close).toHaveBeenCalledOnce();
+    expect(mock.port.readable?.locked).toBe(false);
+  });
+
+  it('resets the consecutive recovery limit when real bytes arrive', async () => {
+    const mock = mockPort();
+    const test = harness(mock.port);
+    const interrupted = vi.fn();
+    test.callbacks.onReadError = interrupted;
+    await test.reader.connect(settings);
+    for (let index = 0; index < 5; index++) {
+      mock.recover(new DOMException('recoverable', 'ParityError'));
+      await vi.waitFor(() => expect(interrupted).toHaveBeenCalledTimes(index + 1));
+      mock.enqueue(new Uint8Array([index]));
+      await vi.waitFor(() => expect(test.callbacks.onData).toHaveBeenCalledTimes(index + 1));
+    }
+    expect(mock.port.close).not.toHaveBeenCalled();
+    expect(test.callbacks.onStatus).toHaveBeenLastCalledWith('connected');
+    await test.reader.disconnect();
+  });
+
+  it('allows a recovery callback to cancel a protocol transaction and disconnect before new bytes arrive', async () => {
+    const mock = mockPort();
+    const test = harness(mock.port);
+    test.callbacks.onReadError = () => {
+      void test.reader.disconnect();
+    };
+    await test.reader.connect(settings);
+    const streams = mock.recover(new DOMException('recoverable', 'FramingError'));
+    await vi.waitFor(() => expect(mock.port.close).toHaveBeenCalledOnce());
+    expect(streams.oldStream?.locked).toBe(false);
+    expect(streams.replacement.locked).toBe(false);
+    expect(test.callbacks.onData).not.toHaveBeenCalled();
+    expect(test.callbacks.onStatus).toHaveBeenLastCalledWith('disconnected');
+  });
+});
+
+describe('explicit serial line controls', () => {
+  it('advertises capability without changing line levels at connect and applies only explicit selected levels', async () => {
+    const mock = mockPort();
+    mock.port.setSignals = vi.fn(async () => {});
+    const test = harness(mock.port);
+    await test.reader.connect(settings);
+    expect(test.callbacks.onInfo).toHaveBeenCalledWith(
+      expect.objectContaining({ supportsSignals: true }),
+    );
+    expect(mock.port.setSignals).not.toHaveBeenCalled();
+    await test.reader.setSignals({ dataTerminalReady: false });
+    expect(mock.port.setSignals).toHaveBeenCalledExactlyOnceWith({ dataTerminalReady: false });
+    await test.reader.setSignals({ requestToSend: true });
+    expect(mock.port.setSignals).toHaveBeenLastCalledWith({ requestToSend: true });
+    expect(mock.sent).toEqual([]);
+    await test.reader.disconnect();
+  });
+
+  it('rejects unsupported, disconnected, empty, unknown, or non-boolean controls', async () => {
+    const mock = mockPort();
+    const test = harness(mock.port);
+    await expect(test.reader.setSignals({ dataTerminalReady: true })).rejects.toThrow(
+      'Connect a serial reader',
+    );
+    await test.reader.connect(settings);
+    await expect(test.reader.setSignals({ dataTerminalReady: true })).rejects.toThrow(
+      'does not support',
+    );
+    mock.port.setSignals = vi.fn(async () => {});
+    await expect(test.reader.setSignals({})).rejects.toThrow('Choose a DTR or RTS');
+    await expect(test.reader.setSignals({ dataTerminalReady: undefined })).rejects.toThrow(
+      'Choose a DTR or RTS',
+    );
+    await expect(test.reader.setSignals({ break: true } as SerialOutputSignals)).rejects.toThrow(
+      'only DTR and RTS',
+    );
+    await expect(
+      test.reader.setSignals({ dataTerminalReady: 'yes' } as unknown as SerialOutputSignals),
+    ).rejects.toThrow('High, Low');
+    expect(mock.port.setSignals).not.toHaveBeenCalled();
+    await test.reader.disconnect();
+  });
+
+  it('prevents changing RTS under hardware flow control but permits explicit DTR', async () => {
+    const mock = mockPort();
+    mock.port.setSignals = vi.fn(async () => {});
+    const test = harness(mock.port);
+    await test.reader.connect({ ...settings, flowControl: 'hardware' });
+    await expect(test.reader.setSignals({ requestToSend: true })).rejects.toThrow(
+      'managed by hardware flow control',
+    );
+    await test.reader.setSignals({ dataTerminalReady: true });
+    expect(mock.port.setSignals).toHaveBeenCalledExactlyOnceWith({ dataTerminalReady: true });
+    await test.reader.disconnect();
+  });
+
+  it('serializes explicit line changes after writes and snapshots selected levels', async () => {
+    const pending = deferred<void>();
+    const mock = mockPort({ write: () => pending.promise });
+    mock.port.setSignals = vi.fn(async () => {});
+    const test = harness(mock.port);
+    await test.reader.connect(settings);
+    const write = test.reader.send(new Uint8Array([1]));
+    const levels = { dataTerminalReady: true };
+    const applying = test.reader.setSignals(levels);
+    levels.dataTerminalReady = false;
+    await vi.waitFor(() => expect(mock.sent).toHaveLength(1));
+    expect(mock.port.setSignals).not.toHaveBeenCalled();
+    pending.resolve();
+    await Promise.all([write, applying]);
+    expect(mock.port.setSignals).toHaveBeenCalledExactlyOnceWith({ dataTerminalReady: true });
+    await test.reader.disconnect();
+  });
+
+  it('cancels queued line changes without applying them after disconnect', async () => {
+    const pending = deferred<void>();
+    const mock = mockPort({ write: () => pending.promise });
+    mock.port.setSignals = vi.fn(async () => {});
+    const test = harness(mock.port);
+    await test.reader.connect(settings);
+    const write = test.reader.send(new Uint8Array([1])).catch(() => {});
+    const outcome = test.reader
+      .setSignals({ dataTerminalReady: true })
+      .catch((error: Error) => error.message);
+    await vi.waitFor(() => expect(mock.sent).toHaveLength(1));
+    await test.reader.disconnect();
+    await write;
+    expect(await outcome).toContain('cancelled');
+    expect(mock.port.setSignals).not.toHaveBeenCalled();
+    pending.resolve();
+  });
+
+  it('bounds a stalled signal change and disconnects without stale continuation', async () => {
+    vi.useFakeTimers();
+    const pending = deferred<void>();
+    const mock = mockPort();
+    mock.port.setSignals = vi.fn(() => pending.promise);
+    const test = harness(mock.port);
+    await test.reader.connect(settings);
+    const outcome = test.reader
+      .setSignals({ requestToSend: false })
+      .catch((error: Error) => error.message);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(await outcome).toContain('timed out after 5 seconds');
+    await test.reader.disconnect();
+    expect(mock.port.close).toHaveBeenCalledOnce();
+    const statusCount = vi.mocked(test.callbacks.onStatus).mock.calls.length;
+    pending.resolve();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(test.callbacks.onStatus).toHaveBeenCalledTimes(statusCount);
   });
 });
 

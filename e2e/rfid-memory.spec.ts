@@ -351,6 +351,34 @@ test('uses the configured HID report IDs for memory reads and verification', asy
   ]);
 });
 
+test('defaults HID memory reads to a declared input report and permits an explicit override', async ({
+  page,
+}) => {
+  await connect(page, 'hid');
+  const inputReport = page.getByRole('spinbutton', { name: 'Input report ID', exact: true });
+  await expect(inputReport).toHaveValue('1');
+  await expect(
+    page.getByRole('spinbutton', { name: 'Memory output report ID', exact: true }),
+  ).toHaveValue('2');
+  // Configure the protocol without calling the HID helper that overrides report IDs.
+  await configure(page);
+  await page.getByRole('button', { name: 'Read value', exact: true }).click();
+  await expect
+    .poll(() => writes(page))
+    .toEqual([{ transport: 'hid', reportId: 2, bytes: [0xaa, 1] }]);
+  await receive(page, [0xbb, 1, 65, 66, 67, 68], 1);
+  await expect(page.getByTestId('rfid-memory-value')).toHaveText('ABCD');
+  await expect(page.getByTestId('rfid-last-input')).toContainText('BB 01 41 42 43 44');
+
+  await inputReport.fill('3');
+  await page.getByRole('button', { name: 'Read value', exact: true }).click();
+  await expect.poll(async () => (await writes(page)).length).toBe(2);
+  await receive(page, [0xbb, 1, 87, 88, 89, 90], 3);
+  await expect(page.getByTestId('rfid-memory-value')).toHaveText('WXYZ');
+  await expect(inputReport).toHaveValue('3');
+  await expect(page.getByRole('alert')).toHaveCount(0);
+});
+
 test('rejects incomplete profiles and wrong value lengths and keeps memory state out of URLs', async ({
   page,
 }) => {

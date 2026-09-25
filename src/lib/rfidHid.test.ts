@@ -158,12 +158,13 @@ describe('WebHID availability and permission', () => {
   it.each(['NotReadableError', 'NetworkError', 'InvalidStateError'])(
     'explains a busy or unavailable device: %s',
     async (name) => {
-      const { reader, device, events, listeners } = setup();
+      const { reader, device, events, listeners, deviceListeners } = setup();
       vi.mocked(device.open).mockRejectedValue(new DOMException('', name));
       await reader.connect();
       expect(events.onError).toHaveBeenCalledWith(expect.stringContaining('busy'));
       expect(events.onStatus).toHaveBeenLastCalledWith('disconnected');
       expect(listeners.size).toBe(0);
+      expect(deviceListeners.size).toBe(0);
     },
   );
 
@@ -179,7 +180,41 @@ describe('WebHID availability and permission', () => {
   });
 });
 
-describe('raw input and declared output reports', () => {
+describe('raw input and declared reports', () => {
+  it('receives the first report delivered synchronously while opening the device', async () => {
+    const { reader, device, events, emit } = setup();
+    vi.mocked(device.open).mockImplementation(async () => {
+      device.opened = true;
+      emit(new DataView(new Uint8Array([0, 65, 255]).buffer), 1);
+    });
+    await reader.connect();
+    expect(events.onData).toHaveBeenCalledExactlyOnceWith(new Uint8Array([0, 65, 255]), 1);
+    expect(events.onStatus).toHaveBeenLastCalledWith('connected');
+    await reader.disconnect();
+  });
+
+  it('receives reports during a pending open but ignores queued reports after cancellation', async () => {
+    const { reader, device, events, emit, deviceListeners } = setup();
+    const opened = deferred<void>();
+    vi.mocked(device.open).mockImplementation(async () => {
+      await opened.promise;
+      device.opened = true;
+    });
+    const connection = reader.connect();
+    await settle();
+    expect(events.onStatus).toHaveBeenLastCalledWith('connecting');
+    emit(new DataView(new Uint8Array([42]).buffer));
+    expect(events.onData).toHaveBeenCalledExactlyOnceWith(new Uint8Array([42]), 1);
+    const queuedListener = [...deviceListeners][0];
+    await reader.disconnect();
+    queuedListener({ device, reportId: 1, data: new DataView(new Uint8Array([99]).buffer) });
+    opened.resolve();
+    await connection;
+    expect(events.onData).toHaveBeenCalledOnce();
+    expect(deviceListeners.size).toBe(0);
+    expect(device.close).toHaveBeenCalledOnce();
+  });
+
   it('preserves input bytes, DataView offsets, and report IDs without retaining the source buffer', async () => {
     const { reader, emit, events } = setup();
     await reader.connect();
@@ -192,12 +227,18 @@ describe('raw input and declared output reports', () => {
     await reader.disconnect();
   });
 
-  it('finds nested output IDs, including zero, without exposing protected keyboard reports', async () => {
+  it('finds nested input/output IDs, including zero, without exposing protected keyboard reports', async () => {
     const { reader, events, emit, device } = setup([
       {
         usagePage: 0xff00,
+        inputReports: [{ reportId: 4 }, { reportId: 0 }, { reportId: 9 }, { reportId: 256 }],
         outputReports: [{ reportId: 3 }, { reportId: 0 }, { reportId: 256 }],
-        children: [{ outputReports: [{ reportId: 2 }, { reportId: 3 }, { reportId: -1 }] }],
+        children: [
+          {
+            inputReports: [{ reportId: 4 }, { reportId: 2 }, { reportId: -1 }],
+            outputReports: [{ reportId: 2 }, { reportId: 3 }, { reportId: -1 }],
+          },
+        ],
       },
       {
         usagePage: 0x01,
@@ -212,6 +253,7 @@ describe('raw input and declared output reports', () => {
       name: 'Test RFID reader',
       vendorId: 0x1234,
       productId: 0x5678,
+      inputReportIds: [0, 2, 4],
       outputReportIds: [0, 2],
     });
     emit(new DataView(new Uint8Array([65]).buffer), 9);
@@ -247,6 +289,82 @@ describe('raw input and declared output reports', () => {
     expect(keyboard.open).not.toHaveBeenCalled();
     expect(device.open).toHaveBeenCalledOnce();
     await reader.disconnect();
+  });
+
+  it('selects vendor data input instead of earlier keyboard, mouse, or consumer controls', async () => {
+    const { reader, api, device, events } = setup([
+      {
+        usagePage: 0xffa0,
+        usage: 1,
+        inputReports: [{ reportId: 0 }],
+        outputReports: [{ reportId: 0 }],
+      },
+    ]);
+    const keyboard = fakeDevice([{ usagePage: 1, usage: 6, inputReports: [{ reportId: 0 }] }]);
+    const mouse = fakeDevice([{ usagePage: 1, usage: 2, inputReports: [{ reportId: 1 }] }]);
+    const controls = fakeDevice([
+      { usagePage: 1, usage: 0x80, inputReports: [{ reportId: 1 }] },
+      { usagePage: 0x0c, usage: 1, inputReports: [{ reportId: 2 }] },
+    ]);
+    vi.mocked(api.requestDevice).mockResolvedValue([
+      keyboard.device,
+      controls.device,
+      mouse.device,
+      device,
+    ]);
+    await reader.connect();
+    for (const other of [keyboard, controls, mouse])
+      expect(other.device.open).not.toHaveBeenCalled();
+    expect(device.open).toHaveBeenCalledOnce();
+    expect(device.sendReport).not.toHaveBeenCalled();
+    expect(events.onInfo).toHaveBeenCalledWith(
+      expect.objectContaining({ inputReportIds: [0], outputReportIds: [0] }),
+    );
+    await reader.disconnect();
+  });
+
+  it('selects an input-capable interface before an output-only vendor interface', async () => {
+    const { reader, api, device } = setup([{ usagePage: 0x8c, inputReports: [{ reportId: 5 }] }]);
+    const outputOnly = fakeDevice([{ usagePage: 0xff00, outputReports: [{ reportId: 1 }] }]);
+    vi.mocked(api.requestDevice).mockResolvedValue([outputOnly.device, device]);
+    await reader.connect();
+    expect(outputOnly.device.open).not.toHaveBeenCalled();
+    expect(device.open).toHaveBeenCalledOnce();
+    await reader.disconnect();
+  });
+
+  it('retains output-only diagnostic support and reports that no input reports are declared', async () => {
+    const { reader, device, events } = setup([
+      { usagePage: 0xff00, outputReports: [{ reportId: 3 }] },
+    ]);
+    await reader.connect();
+    expect(events.onInfo).toHaveBeenCalledWith(
+      expect.objectContaining({ inputReportIds: [], outputReportIds: [3] }),
+    );
+    await reader.send(3, new Uint8Array([7]));
+    expect(device.sendReport).toHaveBeenCalledWith(3, new Uint8Array([7]));
+    await reader.disconnect();
+  });
+
+  it.each([0x01, 0x02, 0x80, 0x8f, 0xa0, 0xb6])(
+    'does not open protected generic-desktop usage %s as a raw reader',
+    async (usage) => {
+      const { reader, device, events } = setup([
+        { usagePage: 1, usage, inputReports: [{ reportId: 1 }], outputReports: [{ reportId: 2 }] },
+      ]);
+      await reader.connect();
+      expect(device.open).not.toHaveBeenCalled();
+      expect(events.onInfo).not.toHaveBeenCalled();
+      expect(events.onError).toHaveBeenCalledWith(expect.stringContaining('no accessible'));
+    },
+  );
+
+  it('does not announce a connection for a descriptor with no input or output reports', async () => {
+    const { reader, device, events } = setup([{ usagePage: 0xff00, usage: 1 }]);
+    await reader.connect();
+    expect(device.open).not.toHaveBeenCalled();
+    expect(events.onError).toHaveBeenCalledWith(expect.stringContaining('no accessible'));
+    expect(events.onStatus).toHaveBeenLastCalledWith('disconnected');
   });
 
   it('sends only manually requested declared reports, with an independent exact payload', async () => {

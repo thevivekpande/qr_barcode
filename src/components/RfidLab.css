@@ -464,3 +464,72 @@
     padding: 20px 0;
   }
 }
+.rfid-hid-help {
+  margin-top: 15px;
+  padding-top: 15px;
+  border-top: 1px solid var(--line);
+}
+.rfid-hid-help button {
+  width: 100%;
+  margin-top: 11px;
+  padding: 12px;
+}
+.rfid-reports {
+  margin-top: 14px;
+  font-family: var(--mono);
+  font-size: 10px;
+}
+.rfid-signals {
+  margin-top: 18px;
+  border-top: 1px solid var(--line);
+  padding-top: 15px;
+}
+.rfid-signals summary {
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 500;
+}
+.rfid-signals > p {
+  margin: 12px 0;
+}
+.rfid-signals > button {
+  padding: 11px;
+  width: 100%;
+  margin-top: 13px;
+}
+.rfid-support .text-button {
+  margin-top: 8px;
+  font-size: 11px;
+}
+.rfid-raw-input {
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--line);
+  background: #f7f9f1;
+}
+.rfid-raw-input summary {
+  cursor: pointer;
+  color: #6b7d59;
+  font: 10px var(--mono);
+}
+.rfid-raw-input pre {
+  font: 12px/1.6 var(--mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 120px;
+  overflow: auto;
+  margin: 13px 0 8px;
+}
+.rfid-raw-input code {
+  display: block;
+  font: 10px/1.8 var(--mono);
+  overflow-wrap: anywhere;
+  max-height: 100px;
+  overflow: auto;
+  color: #7a8967;
+}
+.rfid-raw-input p {
+  font-size: 9px;
+  color: #8a957d;
+  line-height: 1.7;
+  margin-top: 9px;
+}

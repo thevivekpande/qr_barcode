@@ -7,6 +7,7 @@ export type HidCallbacks = {
     name: string;
     vendorId?: number;
     productId?: number;
+    inputReportIds: number[];
     outputReportIds: number[];
   }) => void;
   onError: (message: string) => void;
@@ -79,33 +80,50 @@ function validReportId(value: number): boolean {
 }
 
 function reportInfo(device: RawHidDevice) {
+  const inputIds = new Set<number>();
   const outputIds = new Set<number>();
+  const vendorInputIds = new Set<number>();
   const blockedOutputIds = new Set<number>();
   const blockedInputIds = new Set<number>();
-  let hasRawCollection = false;
-  const pending = device.collections.map((collection) => ({ collection, blocked: false }));
+  const pending = device.collections.map((collection) => ({
+    collection,
+    blocked: false,
+    vendor: false,
+  }));
   while (pending.length) {
-    const { collection, blocked: inherited } = pending.pop()!;
-    // Standard keyboard/keypad reports belong in the UI's keyboard mode, never raw HID.
+    const { collection, blocked: inherited, vendor: inheritedVendor } = pending.pop()!;
+    const usage = collection.usage ?? -1;
+    // Match the standard protected input/output usages. The browser remains the authority
+    // for additional device-specific restrictions; this adapter never bypasses them.
+    // https://source.chromium.org/chromium/chromium/src/+/main:services/device/public/cpp/hid/hid_report_utils.cc
     const blocked =
       inherited ||
       collection.usagePage === 0x07 ||
-      (collection.usagePage === 0x01 && (collection.usage === 0x06 || collection.usage === 0x07));
-    if (!blocked) hasRawCollection = true;
+      (collection.usagePage === 0x01 &&
+        ([0x01, 0x02, 0x06, 0x07].includes(usage) ||
+          (usage >= 0x80 && usage <= 0x8f) ||
+          (usage >= 0xa0 && usage <= 0xb6)));
+    const vendor = inheritedVendor || (collection.usagePage ?? 0) >= 0xff00;
     for (const report of collection.outputReports ?? []) {
       if (validReportId(report.reportId)) {
         (blocked ? blockedOutputIds : outputIds).add(report.reportId);
       }
     }
-    if (blocked) {
-      for (const report of collection.inputReports ?? []) {
-        if (validReportId(report.reportId)) blockedInputIds.add(report.reportId);
+    for (const report of collection.inputReports ?? []) {
+      if (validReportId(report.reportId)) {
+        (blocked ? blockedInputIds : inputIds).add(report.reportId);
+        if (!blocked && vendor) vendorInputIds.add(report.reportId);
       }
     }
-    for (const child of collection.children ?? []) pending.push({ collection: child, blocked });
+    for (const child of collection.children ?? [])
+      pending.push({ collection: child, blocked, vendor });
   }
   for (const reportId of blockedOutputIds) outputIds.delete(reportId);
-  return { outputIds, blockedInputIds, hasRawCollection };
+  for (const reportId of blockedInputIds) {
+    inputIds.delete(reportId);
+    vendorInputIds.delete(reportId);
+  }
+  return { inputIds, outputIds, vendorInputIds, blockedInputIds };
 }
 
 function errorMessage(error: unknown, action: 'connect' | 'send' | 'close'): string {
@@ -221,14 +239,24 @@ export function createHidReader(callbacks: HidCallbacks, api = browserHid()) {
         await stop(session);
         return;
       }
-      const device = devices.find((candidate) => reportInfo(candidate).hasRawCollection);
-      if (!device) {
+      const interfaces = devices.map((device) => ({ device, info: reportInfo(device) }));
+      // Composite readers can expose consumer-control interfaces before their data interface.
+      // Prefer vendor input reports, then another input-capable interface, while retaining
+      // output-only diagnostic support. Open one interface and send no automatic commands.
+      const selected =
+        interfaces.find(({ info }) => info.vendorInputIds.size && info.outputIds.size) ??
+        interfaces.find(({ info }) => info.vendorInputIds.size) ??
+        interfaces.find(({ info }) => info.inputIds.size && info.outputIds.size) ??
+        interfaces.find(({ info }) => info.inputIds.size) ??
+        interfaces.find(({ info }) => info.outputIds.size);
+      if (!selected) {
         callbacks.onError(
-          'This reader exposes keyboard reports only. Choose keyboard mode to read its text; raw HID cannot access protected keyboard reports.',
+          'This device exposes no accessible input or output reports for raw HID. If it sends tag text as keystrokes, choose keyboard mode. Protected keyboard, mouse, and system-control reports cannot be accessed here.',
         );
         await stop(session);
         return;
       }
+      const { device, info } = selected;
       if (device.opened || owners.has(device)) {
         callbacks.onError(
           'This HID reader is already open or still disconnecting. Close other reader software, wait a moment, and connect again.',
@@ -239,7 +267,6 @@ export function createHidReader(callbacks: HidCallbacks, api = browserHid()) {
       session.device = device;
       session.ownsDevice = true;
       owners.set(device, session);
-      const info = reportInfo(device);
       session.outputIds = info.outputIds;
       session.disconnectListener = (event) => {
         if (event.device !== device || !isCurrent(session)) return;
@@ -249,6 +276,26 @@ export function createHidReader(callbacks: HidCallbacks, api = browserHid()) {
         void stop(session, true);
       };
       api.addEventListener('disconnect', session.disconnectListener);
+      // Register before open: a device can deliver its first report as opening completes,
+      // before the open promise continuation has announced the connected state.
+      session.inputListener = (event) => {
+        if (
+          !isCurrent(session) ||
+          (status !== 'connecting' && status !== 'connected') ||
+          event.device !== device ||
+          !validReportId(event.reportId) ||
+          info.blockedInputIds.has(event.reportId)
+        )
+          return;
+        // Respect DataView's subrange and detach the bytes from the browser's event buffer.
+        const data = new Uint8Array(
+          event.data.buffer,
+          event.data.byteOffset,
+          event.data.byteLength,
+        );
+        callbacks.onData(Uint8Array.from(data), event.reportId);
+      };
+      device.addEventListener('inputreport', session.inputListener);
       session.opening = true;
       emitStatus('connecting');
       if (!isCurrent(session)) {
@@ -265,28 +312,11 @@ export function createHidReader(callbacks: HidCallbacks, api = browserHid()) {
         await closeOwned(session);
         return;
       }
-      session.inputListener = (event) => {
-        if (
-          !isCurrent(session) ||
-          status !== 'connected' ||
-          event.device !== device ||
-          !validReportId(event.reportId) ||
-          info.blockedInputIds.has(event.reportId)
-        )
-          return;
-        // Respect DataView's subrange and detach the bytes from the browser's event buffer.
-        const data = new Uint8Array(
-          event.data.buffer,
-          event.data.byteOffset,
-          event.data.byteLength,
-        );
-        callbacks.onData(Uint8Array.from(data), event.reportId);
-      };
-      device.addEventListener('inputreport', session.inputListener);
       callbacks.onInfo({
         name: device.productName || 'USB HID reader',
         vendorId: device.vendorId,
         productId: device.productId,
+        inputReportIds: [...info.inputIds].sort((first, second) => first - second),
         outputReportIds: [...session.outputIds].sort((first, second) => first - second),
       });
       if (isCurrent(session)) emitStatus('connected');

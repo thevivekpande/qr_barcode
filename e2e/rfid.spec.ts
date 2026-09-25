@@ -6,6 +6,7 @@ type HardwareOptions = {
   cancelSerial?: boolean;
   unsupported?: boolean;
   deferHidWrites?: boolean;
+  compositeHid?: boolean;
 };
 type HardwareState = {
   hid: {
@@ -27,6 +28,7 @@ type HardwareState = {
     readCancels: number;
     disconnectListeners: number;
     writes: number[][];
+    signals: Record<string, boolean>[];
     openOptions: Record<string, unknown>[];
     controller: ReadableStreamDefaultController<Uint8Array> | null;
     manager: EventTarget;
@@ -70,6 +72,7 @@ async function installHardware(page: Page, options: HardwareOptions = {}) {
       readCancels: 0,
       disconnectListeners: 0,
       writes: [] as number[][],
+      signals: [] as Record<string, boolean>[],
       openOptions: [] as Record<string, unknown>[],
       controller: null as ReadableStreamDefaultController<Uint8Array> | null,
     };
@@ -150,6 +153,27 @@ async function installHardware(page: Page, options: HardwareOptions = {}) {
       }
     }
     const device = new FakeHidDevice();
+    const controlsInterface = Object.assign(new EventTarget(), {
+      opened: false,
+      productName: 'Mock composite controls interface',
+      vendorId: 0x1234,
+      productId: 0x5678,
+      collections: [
+        {
+          usagePage: 0x0c,
+          usage: 1,
+          inputReports: [{ reportId: 4 }],
+          outputReports: [],
+          children: [],
+        },
+      ],
+      async open() {
+        this.opened = true;
+      },
+      async close() {
+        this.opened = false;
+      },
+    });
     const hidManager = Object.assign(
       new TrackedEvents((type, count) => {
         if (type === 'disconnect') hid.disconnectListeners = count;
@@ -157,7 +181,11 @@ async function installHardware(page: Page, options: HardwareOptions = {}) {
       {
         async requestDevice() {
           hid.requests += 1;
-          return behavior.cancelHid ? [] : [device];
+          return behavior.cancelHid
+            ? []
+            : behavior.compositeHid
+              ? [controlsInterface, device]
+              : [device];
         },
         async getDevices() {
           return [];
@@ -170,6 +198,9 @@ async function installHardware(page: Page, options: HardwareOptions = {}) {
       writable: WritableStream<Uint8Array> | null = null;
       getInfo() {
         return { usbVendorId: 0x1a86, usbProductId: 0x7523 };
+      }
+      async setSignals(values: Record<string, boolean>) {
+        serial.signals.push(values);
       }
       async open(openOptions: Record<string, unknown>) {
         serial.opens += 1;
@@ -247,6 +278,7 @@ async function state(page: Page) {
         closes: hardware.serial.closes,
         readCancels: hardware.serial.readCancels,
         writes: hardware.serial.writes,
+        signals: hardware.serial.signals,
         openOptions: hardware.serial.openOptions,
         disconnectListeners: hardware.serial.disconnectListeners,
         readLocked: hardware.serial.port.readable?.locked ?? false,
@@ -454,6 +486,7 @@ test('frames serial UTF-8 across split CRLF and releases reader and writer locks
   await page.getByLabel('Stop bits', { exact: true }).selectOption('2');
   await page.getByLabel('Parity', { exact: true }).selectOption('even');
   await page.getByLabel('Flow control', { exact: true }).selectOption('hardware');
+  await page.getByLabel('Receive framing', { exact: true }).selectOption('lines');
   await page.getByRole('button', { name: 'Connect serial reader', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Disconnect reader', exact: true })).toBeVisible();
   expect((await state(page)).serial.openOptions).toEqual([
@@ -652,4 +685,175 @@ test('shares RFID settings without persisting commands, received data, or device
   } finally {
     await freshContext.close();
   }
+});
+
+test('captures suffixless keyboard scans by default and keeps Enter and Tab scans distinct', async ({
+  page,
+}) => {
+  await installHardware(page);
+  await page.goto('/rfid');
+  await expect(page.getByLabel('End of scan', { exact: true })).toHaveValue('auto');
+  await expect(page.getByLabel('Idle gap (ms)', { exact: true })).toHaveValue('150');
+  const time = new Date('2026-09-25T12:00:00Z');
+  await page.clock.install({ time });
+  await page.clock.pauseAt(time);
+  await page.getByRole('button', { name: 'Start keyboard test', exact: true }).click();
+  const reader = page.getByLabel('Reader input', { exact: true });
+  const entries = page.getByTestId('rfid-entry').locator('pre');
+  await expect(reader).toBeFocused();
+  await page.keyboard.type('NO-SUFFIX-TAG');
+  await page.clock.runFor(149);
+  await expect(entries).toHaveCount(0);
+  await page.clock.runFor(2);
+  await expect(entries).toHaveText(['NO-SUFFIX-TAG']);
+  await expect(page.getByTestId('rfid-memory-value')).toHaveText('NO-SUFFIX-TAG');
+  await page.keyboard.type('ENTER-TAG');
+  await page.keyboard.press('Enter');
+  await page.keyboard.type('TAB-TAG');
+  await page.keyboard.press('Tab');
+  await page.clock.runFor(500);
+  await expect(entries).toHaveText(['TAB-TAG', 'ENTER-TAG', 'NO-SUFFIX-TAG']);
+  await expect(reader).toBeFocused();
+
+  await page.getByRole('heading', { level: 1 }).click();
+  await page.keyboard.type('OUTSIDE-INPUT');
+  await page.keyboard.press('Enter');
+  await page.clock.runFor(200);
+  await expect(entries).toHaveCount(3);
+  await page.getByRole('button', { name: 'Focus reader input', exact: true }).click();
+  await expect(reader).toBeFocused();
+  await page.keyboard.type('REFOCUSED');
+  await page.clock.runFor(151);
+  await expect(entries).toHaveText(['REFOCUSED', 'TAB-TAG', 'ENTER-TAG', 'NO-SUFFIX-TAG']);
+  expect((await state(page)).hid.requests).toBe(0);
+  expect((await state(page)).serial.requests).toBe(0);
+});
+
+test('shows suffixless serial input with the default automatic framing', async ({ page }) => {
+  await installHardware(page);
+  await page.goto('/rfid');
+  await page.getByRole('button', { name: 'USB serial', exact: true }).click();
+  await expect(page.getByLabel('Receive framing', { exact: true })).toHaveValue('auto');
+  const time = new Date('2026-09-25T12:00:00Z');
+  await page.clock.install({ time });
+  await page.clock.pauseAt(time);
+  await page.getByRole('button', { name: 'Connect serial reader', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Disconnect reader', exact: true })).toBeVisible();
+  await emitSerial(page, [84, 65, 71, 45, 0xc3]);
+  await page.clock.runFor(70);
+  await emitSerial(page, [0xa9]);
+  await page.clock.runFor(149);
+  await expect(page.getByTestId('rfid-entry')).toHaveCount(0);
+  await page.clock.runFor(2);
+  await expect(page.getByTestId('rfid-entry').locator('pre')).toHaveText(['TAG-é']);
+  await expect(page.getByTestId('rfid-entry').locator('code')).toHaveText(['54 41 47 2D C3 A9']);
+  await emitSerial(page, Array.from(Buffer.from('CRLF-TAG\r\nTRAILING-TAG')));
+  await expect(page.getByTestId('rfid-entry').locator('pre')).toHaveText(['CRLF-TAG', 'TAG-é']);
+  await page.clock.runFor(151);
+  await expect(page.getByTestId('rfid-entry').locator('pre')).toHaveText([
+    'TRAILING-TAG',
+    'CRLF-TAG',
+    'TAG-é',
+  ]);
+  expect((await state(page)).serial.writes).toEqual([]);
+});
+
+test('keeps raw serial bytes visible while strict line framing waits for a suffix', async ({
+  page,
+}, testInfo) => {
+  await installHardware(page);
+  await page.goto('/rfid');
+  await page.getByRole('button', { name: 'USB serial', exact: true }).click();
+  await page.getByLabel('Receive framing', { exact: true }).selectOption('lines');
+  const time = new Date('2026-09-25T12:00:00Z');
+  await page.clock.install({ time });
+  await page.clock.pauseAt(time);
+  await page.getByRole('button', { name: 'Connect serial reader', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Disconnect reader', exact: true })).toBeVisible();
+  await emitSerial(page, Array.from(Buffer.from('NO-SUFFIX-TAG')));
+  const preview = page.getByTestId('rfid-last-input');
+  await expect(preview).toContainText('NO-SUFFIX-TAG');
+  await expect(preview).toContainText('4E 4F 2D 53 55 46 46 49 58 2D 54 41 47');
+  await page.clock.runFor(1_000);
+  await expect(page.getByTestId('rfid-entry')).toHaveCount(0);
+  await expect(page.getByText('13 bytes waiting for a line ending', { exact: true })).toBeVisible();
+  await page.getByRole('region', { name: 'Reader activity', exact: true }).screenshot({
+    path: testInfo.outputPath('serial-pending-visible.png'),
+    animations: 'disabled',
+  });
+  await emitSerial(page, [10]);
+  await expect(page.getByTestId('rfid-entry').locator('pre')).toHaveText(['NO-SUFFIX-TAG']);
+  await emitSerial(page, [0, 255, 65]);
+  await expect(preview).toContainText('00 FF 41');
+  await expect(page.getByTestId('rfid-entry')).toHaveCount(1);
+  await page.getByRole('button', { name: 'Disconnect reader', exact: true }).click();
+  await expect.poll(async () => (await state(page)).serial.closes).toBe(1);
+});
+
+test('switches a connected raw HID reader into focused keyboard capture', async ({ page }) => {
+  await installHardware(page);
+  await page.goto('/rfid');
+  await chooseRawHid(page);
+  const time = new Date('2026-09-25T12:00:00Z');
+  await page.clock.install({ time });
+  await page.clock.pauseAt(time);
+  await page.getByRole('button', { name: 'Connect HID reader', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Disconnect reader', exact: true })).toBeVisible();
+  await page.clock.runFor(5_001);
+  await expect(
+    page.getByRole('status').filter({ hasText: 'No input received yet.' }),
+  ).toBeVisible();
+  await page.getByRole('button', { name: 'Test keyboard input', exact: true }).click();
+  await expect.poll(async () => (await state(page)).hid.opened).toBe(false);
+  expect((await state(page)).hid).toMatchObject({
+    closes: 1,
+    inputListeners: 0,
+    disconnectListeners: 0,
+    reports: [],
+  });
+  await expect(page.getByLabel('Reader mode', { exact: true })).toHaveValue('keyboard');
+  await expect(page.getByLabel('Reader input', { exact: true })).toBeFocused();
+  await page.keyboard.type('KEYBOARD-READER');
+  await page.clock.runFor(151);
+  await expect(page.getByTestId('rfid-memory-value')).toHaveText('KEYBOARD-READER');
+  await expect(page.getByTestId('rfid-entry').locator('pre')).toHaveText(['KEYBOARD-READER']);
+  expect((await state(page)).hid.requests).toBe(1);
+});
+
+test('applies serial line signals only after an explicit request', async ({ page }) => {
+  await installHardware(page);
+  await page.goto('/rfid');
+  await page.getByRole('button', { name: 'USB serial', exact: true }).click();
+  await page.getByRole('button', { name: 'Connect serial reader', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Disconnect reader', exact: true })).toBeVisible();
+  expect((await state(page)).serial.signals).toEqual([]);
+  await page.getByText('Serial line signals', { exact: true }).click();
+  await expect(page.getByLabel('DTR', { exact: true })).toHaveValue('unchanged');
+  await expect(page.getByLabel('RTS', { exact: true })).toHaveValue('unchanged');
+  await page.getByLabel('DTR', { exact: true }).selectOption('high');
+  await page.getByLabel('RTS', { exact: true }).selectOption('low');
+  expect((await state(page)).serial.signals).toEqual([]);
+  await page.getByRole('button', { name: 'Apply line signals', exact: true }).click();
+  await expect
+    .poll(async () => (await state(page)).serial.signals)
+    .toEqual([{ dataTerminalReady: true, requestToSend: false }]);
+  expect((await state(page)).serial.writes).toEqual([]);
+});
+
+test('receives reports from the vendor reader when a composite chooser returns controls first', async ({
+  page,
+}) => {
+  await installHardware(page, { compositeHid: true });
+  await page.goto('/rfid');
+  await chooseRawHid(page);
+  await page.getByRole('button', { name: 'Connect HID reader', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Disconnect reader', exact: true })).toBeVisible();
+  expect((await state(page)).hid.opened).toBe(true);
+  await emitHid(page, Array.from(Buffer.from('COMPOSITE-TAG')));
+  await expect(page.getByTestId('rfid-entry').locator('pre')).toHaveText(['COMPOSITE-TAG']);
+  await expect(page.getByTestId('rfid-last-input')).toContainText('COMPOSITE-TAG');
+  await expect(page.getByRole('spinbutton', { name: 'Input report ID', exact: true })).toHaveValue(
+    '1',
+  );
+  expect((await state(page)).hid.reports).toEqual([]);
 });

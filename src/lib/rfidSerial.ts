@@ -12,8 +12,20 @@ export type SerialStatus =
 export type SerialCallbacks = {
   onStatus: (status: SerialStatus) => void;
   onData: (data: Uint8Array) => void;
-  onInfo: (info: { name: string; vendorId?: number; productId?: number }) => void;
+  onInfo: (info: {
+    name: string;
+    vendorId?: number;
+    productId?: number;
+    supportsSignals?: boolean;
+  }) => void;
   onError: (message: string) => void;
+  /** A recoverable stream interruption: discard partial frames before more data arrives. */
+  onReadError?: (message: string) => void;
+};
+
+export type SerialOutputSignals = {
+  dataTerminalReady?: boolean;
+  requestToSend?: boolean;
 };
 
 /** Minimal Web Serial types keep the adapter independent of ambient browser typings. */
@@ -23,6 +35,7 @@ export interface SerialPortLike {
   open(options: SerialOptions): Promise<void>;
   close(): Promise<void>;
   getInfo(): { usbVendorId?: number; usbProductId?: number };
+  setSignals?(signals: SerialOutputSignals): Promise<void>;
 }
 
 export type SerialDisconnectEvent = { target?: unknown; port?: SerialPortLike };
@@ -45,9 +58,11 @@ type Session = {
   writeAbort: AbortController;
   closing: Promise<void> | null;
   unplug: ((event: SerialDisconnectEvent) => void) | null;
+  flowControl: SerialOptions['flowControl'];
 };
 
 const WRITE_TIMEOUT_MS = 5000;
+const MAX_CONSECUTIVE_READ_RECOVERIES = 3;
 
 function browserSerial(): SerialApi | undefined {
   if (typeof navigator === 'undefined') return undefined;
@@ -169,29 +184,78 @@ export function createSerialReader(callbacks: SerialCallbacks, serial = browserS
   }
 
   async function readLoop(session: Session) {
-    const reader = session.reader;
-    if (!reader) return;
-    try {
-      while (active(session)) {
-        const { value, done } = await reader.read();
-        if (!active(session)) break;
-        if (done) {
-          callbacks.onError('Serial input has ended. Reconnect the reader to continue.');
-          break;
-        }
-        if (value?.byteLength) callbacks.onData(value.slice());
-      }
-    } catch (error) {
-      if (active(session)) {
+    let recoveries = 0;
+    while (active(session)) {
+      const source = session.port?.readable;
+      if (!source) {
         callbacks.onError(
-          errorName(error) === 'NetworkError'
+          'The serial connection was lost. Check the USB cable and reconnect the reader.',
+        );
+        return;
+      }
+      let reader: ReadableStreamDefaultReader<Uint8Array>;
+      try {
+        reader = source.getReader();
+      } catch {
+        callbacks.onError(
+          'The serial input is unavailable or already in use. Reconnect the reader and close other reader apps.',
+        );
+        return;
+      }
+      session.reader = reader;
+      let interrupted: unknown;
+      try {
+        while (active(session)) {
+          const { value, done } = await reader.read();
+          if (!active(session)) return;
+          if (done) {
+            callbacks.onError('Serial input has ended. Reconnect the reader to continue.');
+            return;
+          }
+          if (value?.byteLength) {
+            recoveries = 0;
+            callbacks.onData(value.slice());
+          }
+        }
+      } catch (error) {
+        interrupted = error;
+      } finally {
+        reader.releaseLock();
+        if (session.reader === reader) session.reader = null;
+      }
+      if (!active(session)) return;
+      // Web Serial provides a fresh stream after a nonfatal receive error. Never
+      // reacquire the same errored stream, which would create a rejected-read loop.
+      const replacement = session.port?.readable;
+      if (!replacement || replacement === source) {
+        callbacks.onError(
+          errorName(interrupted) === 'NetworkError'
             ? 'The serial connection was lost. Check the USB cable and reconnect the reader.'
             : 'Could not read from the serial device. Check its connection and serial settings, then reconnect.',
         );
+        return;
       }
-    } finally {
-      reader.releaseLock();
-      session.reader = null;
+      if (++recoveries > MAX_CONSECUTIVE_READ_RECOVERIES) {
+        callbacks.onError(
+          'Serial input repeatedly failed without receiving data. Check the baud rate, parity, wiring, and flow control, then reconnect.',
+        );
+        return;
+      }
+      const cause = errorName(interrupted);
+      const issue =
+        cause === 'ParityError'
+          ? 'A parity error'
+          : cause === 'FramingError'
+            ? 'A framing error'
+            : cause === 'BufferOverrunError'
+              ? 'A receive-buffer overflow'
+              : cause === 'BreakError'
+                ? 'A serial break'
+                : 'A receive error';
+      const message = `${issue} interrupted serial input. Some bytes may have been lost; reading will resume. Check serial settings if this repeats.`;
+      (callbacks.onReadError ?? callbacks.onError)(message);
+      // A callback can cancel an in-flight protocol transaction and disconnect.
+      if (!active(session)) return;
     }
   }
 
@@ -232,6 +296,7 @@ export function createSerialReader(callbacks: SerialCallbacks, serial = browserS
       writeAbort: new AbortController(),
       closing: null,
       unplug: null,
+      flowControl: selectedOptions.flowControl,
     };
     current = session;
     callbacks.onStatus('requesting');
@@ -265,7 +330,6 @@ export function createSerialReader(callbacks: SerialCallbacks, serial = browserS
         return;
       }
       if (!port.readable) throw new Error('No serial input stream is available.');
-      session.reader = port.readable.getReader();
       session.connected = true;
       const info = port.getInfo();
       const vendor = info.usbVendorId?.toString(16).padStart(4, '0').toUpperCase();
@@ -276,6 +340,7 @@ export function createSerialReader(callbacks: SerialCallbacks, serial = browserS
           : 'Serial reader',
         vendorId: info.usbVendorId,
         productId: info.usbProductId,
+        supportsSignals: typeof port.setSignals === 'function',
       });
       session.reading = readLoop(session);
       void session.reading.then(() => {
@@ -339,5 +404,63 @@ export function createSerialReader(callbacks: SerialCallbacks, serial = browserS
     return task;
   }
 
-  return { connect, disconnect, send };
+  function setSignals(signals: SerialOutputSignals): Promise<void> {
+    const session = current;
+    if (!session || !active(session) || !session.connected) {
+      return Promise.reject(new Error('Connect a serial reader before applying line signals.'));
+    }
+    if (
+      !signals ||
+      typeof signals !== 'object' ||
+      Object.keys(signals).some((key) => key !== 'dataTerminalReady' && key !== 'requestToSend')
+    ) {
+      return Promise.reject(new Error('Choose only DTR and RTS line signal settings.'));
+    }
+    const selection: SerialOutputSignals = {};
+    for (const key of ['dataTerminalReady', 'requestToSend'] as const) {
+      if (signals[key] === undefined) continue;
+      if (typeof signals[key] !== 'boolean')
+        return Promise.reject(
+          new Error('Choose High, Low, or Leave unchanged for each line signal.'),
+        );
+      selection[key] = signals[key];
+    }
+    if (!Object.keys(selection).length)
+      return Promise.reject(new Error('Choose a DTR or RTS level to apply.'));
+    if (selection.requestToSend !== undefined && session.flowControl === 'hardware') {
+      return Promise.reject(
+        new Error(
+          'RTS is managed by hardware flow control. Choose no flow control before changing RTS manually.',
+        ),
+      );
+    }
+    if (typeof session.port?.setSignals !== 'function') {
+      return Promise.reject(
+        new Error('This browser or serial reader does not support changing line signals.'),
+      );
+    }
+    const task = session.writes.then(async () => {
+      if (!active(session) || !session.connected)
+        throw new Error('The line signal change was cancelled because the reader disconnected.');
+      try {
+        await boundedWrite(session.port!.setSignals!(selection), session.writeAbort.signal);
+      } catch (error) {
+        if (session.cancelled)
+          throw new Error('The line signal change was cancelled because the reader disconnected.');
+        if (errorName(error) === 'TimeoutError') {
+          void closeSession(session);
+          throw new Error(
+            'Applying line signals timed out after 5 seconds. Reconnect the reader before trying again.',
+          );
+        }
+        throw new Error(
+          'The line signals could not be applied. Check that your reader and its driver support the selected controls.',
+        );
+      }
+    });
+    session.writes = task.catch(() => {});
+    return task;
+  }
+
+  return { connect, disconnect, send, setSignals };
 }
