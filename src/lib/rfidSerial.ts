@@ -92,6 +92,32 @@ function errorName(error: unknown): string {
   return error && typeof error === 'object' && 'name' in error ? String(error.name) : '';
 }
 
+function withErrorDetails(message: string, error: unknown): string {
+  const clean = (value: unknown) =>
+    typeof value === 'string'
+      ? value
+          .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ')
+          .replace(/\s+/gu, ' ')
+          .trim()
+      : '';
+  let details = '';
+  if (typeof error === 'string') details = clean(error);
+  else if (error && typeof error === 'object') {
+    // Custom errors may have unusual properties; diagnostics must not prevent cleanup.
+    try {
+      const cause = error as { name?: unknown; message?: unknown };
+      details = [clean(cause.name), clean(cause.message)].filter(Boolean).join(': ');
+    } catch {
+      return message;
+    }
+  }
+  if (!details) return message;
+  const characters = Array.from(details);
+  const bounded = characters.length > 320 ? `${characters.slice(0, 319).join('')}…` : details;
+  // The consumer renders this as text, never as HTML. Do not include stacks or other fields.
+  return `${message} Details: ${bounded}`;
+}
+
 function connectionError(error: unknown, selecting: boolean): string {
   const name = errorName(error);
   if (name === 'NotFoundError' || name === 'AbortError')
@@ -153,7 +179,10 @@ export function createSerialReader(callbacks: SerialCallbacks, serial = browserS
             !['InvalidStateError', 'NetworkError'].includes(errorName(error))
           ) {
             callbacks.onError(
-              'The serial reader could not close cleanly. Unplug it before connecting again.',
+              withErrorDetails(
+                'The serial reader could not close cleanly. Unplug it before connecting again.',
+                error,
+              ),
             );
           }
         }
@@ -196,9 +225,12 @@ export function createSerialReader(callbacks: SerialCallbacks, serial = browserS
       let reader: ReadableStreamDefaultReader<Uint8Array>;
       try {
         reader = source.getReader();
-      } catch {
+      } catch (error) {
         callbacks.onError(
-          'The serial input is unavailable or already in use. Reconnect the reader and close other reader apps.',
+          withErrorDetails(
+            'The serial input is unavailable or already in use. Reconnect the reader and close other reader apps.',
+            error,
+          ),
         );
         return;
       }
@@ -229,15 +261,21 @@ export function createSerialReader(callbacks: SerialCallbacks, serial = browserS
       const replacement = session.port?.readable;
       if (!replacement || replacement === source) {
         callbacks.onError(
-          errorName(interrupted) === 'NetworkError'
-            ? 'The serial connection was lost. Check the USB cable and reconnect the reader.'
-            : 'Could not read from the serial device. Check its connection and serial settings, then reconnect.',
+          withErrorDetails(
+            errorName(interrupted) === 'NetworkError'
+              ? 'The serial connection was lost. Check the USB cable and reconnect the reader.'
+              : 'Could not read from the serial device. Check its connection and serial settings, then reconnect.',
+            interrupted,
+          ),
         );
         return;
       }
       if (++recoveries > MAX_CONSECUTIVE_READ_RECOVERIES) {
         callbacks.onError(
-          'Serial input repeatedly failed without receiving data. Check the baud rate, parity, wiring, and flow control, then reconnect.',
+          withErrorDetails(
+            'Serial input repeatedly failed without receiving data. Check the baud rate, parity, wiring, and flow control, then reconnect.',
+            interrupted,
+          ),
         );
         return;
       }
@@ -253,7 +291,7 @@ export function createSerialReader(callbacks: SerialCallbacks, serial = browserS
                 ? 'A serial break'
                 : 'A receive error';
       const message = `${issue} interrupted serial input. Some bytes may have been lost; reading will resume. Check serial settings if this repeats.`;
-      (callbacks.onReadError ?? callbacks.onError)(message);
+      (callbacks.onReadError ?? callbacks.onError)(withErrorDetails(message, interrupted));
       // A callback can cancel an in-flight protocol transaction and disconnect.
       if (!active(session)) return;
     }
@@ -348,7 +386,8 @@ export function createSerialReader(callbacks: SerialCallbacks, serial = browserS
       });
       if (active(session)) callbacks.onStatus('connected');
     } catch (error) {
-      if (active(session)) callbacks.onError(connectionError(error, selecting));
+      if (active(session))
+        callbacks.onError(withErrorDetails(connectionError(error, selecting), error));
       await closeSession(session);
     }
   }

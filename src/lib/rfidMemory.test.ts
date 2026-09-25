@@ -48,6 +48,7 @@ async function settle() {
 beforeEach(() => vi.useFakeTimers());
 afterEach(() => {
   cleanups.splice(0).forEach((cleanup) => cleanup());
+  vi.restoreAllMocks();
   vi.useRealTimers();
 });
 
@@ -329,6 +330,140 @@ describe('write acknowledgment and fresh readback', () => {
     expect(test.last().phase).toBe('error');
     expect(test.last().message).toContain('unverified');
     expect(test.send).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('deadlines when timeout callbacks are delayed', () => {
+  // Advance monotonic time without running timers, as can happen while a page is
+  // throttled or its event loop is busy. No test relies on real-time sleeping.
+  it.each([500, 750])('rejects a read response delivered at %s ms', async (elapsed) => {
+    const clock = vi.spyOn(performance, 'now').mockReturnValue(0);
+    const test = setup();
+    const reading = test.session.read(profile);
+    await settle();
+    clock.mockReturnValue(elapsed);
+    test.session.receive(response());
+    await reading;
+    expect(test.last()).toMatchObject({ phase: 'error' });
+    expect(test.last().message).toContain('Timed out after 500 ms');
+    expect(test.last().value).toBeUndefined();
+    expect(test.session.busy).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('rejects a value whose prefix arrived in time but whose last bytes arrived late', async () => {
+    const clock = vi.spyOn(performance, 'now').mockReturnValue(0);
+    const test = setup();
+    const reading = test.session.read(profile);
+    clock.mockReturnValue(400);
+    test.session.receive(response().subarray(0, 4));
+    clock.mockReturnValue(600);
+    test.session.receive(response().subarray(4));
+    await reading;
+    expect(test.last().phase).toBe('error');
+    expect(test.last().message).toContain('Timed out');
+    expect(test.states.some((state) => state.phase === 'read')).toBe(false);
+  });
+
+  it('never starts a verification read after a late write acknowledgment', async () => {
+    const clock = vi.spyOn(performance, 'now').mockReturnValue(0);
+    const test = setup();
+    const writing = test.session.writeAndVerify(profile, desired);
+    await settle();
+    clock.mockReturnValue(600);
+    test.session.receive(ack());
+    await writing;
+    expect(test.last().phase).toBe('error');
+    expect(test.last().message).toContain('unverified');
+    expect(test.last().message).toContain('Timed out');
+    expect(test.send).toHaveBeenCalledTimes(1);
+    expect(test.states.some((state) => state.phase === 'verifying')).toBe(false);
+  });
+
+  it('rejects late write delivery despite an acknowledgment received before the deadline', async () => {
+    const clock = vi.spyOn(performance, 'now').mockReturnValue(0);
+    const test = setup();
+    const delivery = deferred<void>();
+    test.send.mockReturnValueOnce(delivery.promise);
+    const writing = test.session.writeAndVerify(profile, desired);
+    clock.mockReturnValue(200);
+    test.session.receive(ack());
+    clock.mockReturnValue(600);
+    delivery.resolve();
+    await writing;
+    expect(test.last().phase).toBe('error');
+    expect(test.last().message).toContain('Timed out');
+    expect(test.send).toHaveBeenCalledTimes(1);
+    expect(test.states.some((state) => state.phase === 'verifying')).toBe(false);
+  });
+
+  it('checks expiry after response completion before starting verification', async () => {
+    const clock = vi.spyOn(performance, 'now').mockReturnValue(0);
+    const test = setup();
+    const writing = test.session.writeAndVerify(profile, desired);
+    await settle();
+    clock.mockReturnValue(400);
+    test.session.receive(ack());
+    // The ACK has matched, but its promise continuation has not run yet.
+    clock.mockReturnValue(600);
+    await writing;
+    expect(test.last().phase).toBe('error');
+    expect(test.last().message).toContain('Timed out');
+    expect(test.send).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    [899, 'verified'],
+    [900, 'error'],
+  ] as const)(
+    'gives fresh readback its own deadline and checks it at %s ms',
+    async (elapsed, phase) => {
+      const clock = vi.spyOn(performance, 'now').mockReturnValue(0);
+      const test = setup();
+      const writing = test.session.writeAndVerify(profile, desired);
+      clock.mockReturnValue(400);
+      test.session.receive(ack());
+      await settle();
+      expect(test.last().phase).toBe('verifying');
+      clock.mockReturnValue(elapsed);
+      test.session.receive(response());
+      await writing;
+      expect(test.last().phase).toBe(phase);
+      expect(test.send).toHaveBeenCalledTimes(2);
+      if (phase === 'error') {
+        expect(test.last().message).toContain('Timed out');
+        expect(test.last().value).toBeUndefined();
+      } else expect(test.last().value).toEqual(desired);
+    },
+  );
+
+  it('does not send a command when a phase callback consumes the whole deadline', async () => {
+    const clock = vi.spyOn(performance, 'now').mockReturnValue(0);
+    const test = setup();
+    test.onState.mockImplementation((state) => {
+      test.states.push(state);
+      if (state.phase === 'reading') clock.mockReturnValue(600);
+    });
+    await test.session.read(profile);
+    expect(test.last().phase).toBe('error');
+    expect(test.last().message).toContain('Timed out');
+    expect(test.send).not.toHaveBeenCalled();
+  });
+
+  it('preserves explicit cancellation when an overdue delivery completes later', async () => {
+    const clock = vi.spyOn(performance, 'now').mockReturnValue(0);
+    const test = setup();
+    const delivery = deferred<void>();
+    test.send.mockReturnValueOnce(delivery.promise);
+    const writing = test.session.writeAndVerify(profile, desired);
+    clock.mockReturnValue(600);
+    test.session.cancel('Reader disconnected.');
+    delivery.resolve();
+    test.session.receive(ack());
+    await writing;
+    expect(test.last().message).toBe('Write result is unverified. Reader disconnected.');
+    expect(test.send).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
 

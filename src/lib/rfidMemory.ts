@@ -167,6 +167,7 @@ type Operation = {
   kind: 'read' | 'write';
   abort: AbortController;
   matcher: ResponseMatcher | null;
+  expireIfOverdue?: () => boolean;
 };
 
 /**
@@ -193,6 +194,7 @@ export function createMemorySession(callbacks: MemoryCallbacks) {
     if (!active(operation)) return;
     current = null;
     operation.matcher = null;
+    operation.expireIfOverdue = undefined;
     operation.abort.abort();
     emit(state);
   }
@@ -216,6 +218,7 @@ export function createMemorySession(callbacks: MemoryCallbacks) {
     message: string,
   ): Promise<Uint8Array> {
     if (!active(operation)) throw new DOMException('Tag operation cancelled.', 'AbortError');
+    const deadline = performance.now() + timeoutMs;
     const matcher = responseMatcher(prefix, width);
     operation.matcher = matcher;
     let interrupt!: (error: Error) => void;
@@ -225,17 +228,27 @@ export function createMemorySession(callbacks: MemoryCallbacks) {
     // A callback may synchronously cancel while the next phase is being announced.
     void interrupted.catch(() => {});
     const cancel = () => interrupt(new DOMException('Tag operation cancelled.', 'AbortError'));
-    const timeout = setTimeout(() => {
-      interrupt(
-        new Error(
-          `Timed out after ${timeoutMs.toLocaleString('en-US')} ms waiting for ${phase === 'writing' ? 'the configured write acknowledgment' : 'the configured read response'} and command delivery.`,
-        ),
-      );
-    }, timeoutMs);
+    const timeoutError = new Error(
+      `Timed out after ${timeoutMs.toLocaleString('en-US')} ms waiting for ${phase === 'writing' ? 'the configured write acknowledgment' : 'the configured read response'} and command delivery.`,
+    );
+    const expire = () => {
+      matcher.armed = false;
+      interrupt(timeoutError);
+    };
+    // Hidden pages may deliver timers late. The timer wakes an idle exchange, while
+    // this monotonic deadline also rejects overdue input and send continuations.
+    const expireIfOverdue = () => {
+      if (performance.now() < deadline) return false;
+      expire();
+      return true;
+    };
+    operation.expireIfOverdue = expireIfOverdue;
+    const timeout = setTimeout(expire, timeoutMs);
     operation.abort.signal.addEventListener('abort', cancel, { once: true });
     try {
       emit({ phase, message });
       if (!active(operation)) throw new DOMException('Tag operation cancelled.', 'AbortError');
+      if (expireIfOverdue()) throw timeoutError;
       // No await separates arming and sending. Even a response emitted synchronously
       // inside send() belongs to this command, while older response leftovers cannot.
       matcher.armed = true;
@@ -245,20 +258,27 @@ export function createMemorySession(callbacks: MemoryCallbacks) {
       } catch {
         throw new Error('The configured command could not be sent. Check the reader connection.');
       }
-      const delivery = sending.catch(() => {
-        throw new Error('The configured command could not be sent. Check the reader connection.');
-      });
+      const delivery = sending.then(
+        () => {
+          if (active(operation) && expireIfOverdue()) throw timeoutError;
+        },
+        () => {
+          throw new Error('The configured command could not be sent. Check the reader connection.');
+        },
+      );
       const [, response] = await Promise.race([
         Promise.all([delivery, matcher.response]),
         interrupted,
       ]);
       if (!active(operation)) throw new DOMException('Tag operation cancelled.', 'AbortError');
+      if (expireIfOverdue()) throw timeoutError;
       return response;
     } finally {
       clearTimeout(timeout);
       operation.abort.signal.removeEventListener('abort', cancel);
       matcher.armed = false;
       if (operation.matcher === matcher) operation.matcher = null;
+      if (operation.expireIfOverdue === expireIfOverdue) operation.expireIfOverdue = undefined;
     }
   }
 
@@ -373,6 +393,7 @@ export function createMemorySession(callbacks: MemoryCallbacks) {
 
   function receive(bytes: Uint8Array): void {
     if (!(bytes instanceof Uint8Array) || !bytes.byteLength || !current || !active(current)) return;
+    if (current.expireIfOverdue?.()) return;
     current.matcher?.push(bytes);
   }
 
@@ -382,6 +403,7 @@ export function createMemorySession(callbacks: MemoryCallbacks) {
     current = null;
     if (operation.matcher) operation.matcher.armed = false;
     operation.matcher = null;
+    operation.expireIfOverdue = undefined;
     operation.abort.abort();
     emit({
       phase: 'error',

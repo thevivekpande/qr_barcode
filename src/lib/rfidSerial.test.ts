@@ -66,7 +66,7 @@ function mockPort(
     aborted,
     enqueue: (value: Uint8Array) => input.enqueue(value),
     end: () => input.close(),
-    fail: (error: Error) => input.error(error),
+    fail: (error: unknown) => input.error(error),
     recover(error: Error) {
       const previous = input;
       const oldStream = port.readable;
@@ -149,6 +149,7 @@ describe('serial support and explicit device selection', () => {
     vi.mocked(test.api.requestPort).mockRejectedValue(new DOMException('', name));
     await test.reader.connect(settings);
     expect(test.callbacks.onError).toHaveBeenCalledWith(expect.stringContaining(expected));
+    expect(test.callbacks.onError).toHaveBeenCalledWith(expect.stringMatching(`Details: ${name}$`));
     expect(test.callbacks.onStatus).toHaveBeenLastCalledWith('disconnected');
   });
 
@@ -231,6 +232,11 @@ describe('serial receive lifecycle', () => {
       expect(mock.port.readable?.locked).toBe(false);
       expect(test.listeners.size).toBe(0);
       expect(test.callbacks.onError).toHaveBeenCalledTimes(1);
+      expect(test.callbacks.onError).toHaveBeenCalledWith(
+        event === 'error'
+          ? 'The serial connection was lost. Check the USB cable and reconnect the reader. Details: NetworkError: unplugged'
+          : 'Serial input has ended. Reconnect the reader to continue.',
+      );
     },
   );
 
@@ -245,6 +251,7 @@ describe('serial receive lifecycle', () => {
     expect(test.callbacks.onError).toHaveBeenCalledWith(
       expect.stringContaining('selected serial reader was disconnected'),
     );
+    expect(vi.mocked(test.callbacks.onError).mock.calls[0][0]).not.toContain('Details:');
     expect(test.callbacks.onStatus).toHaveBeenLastCalledWith('disconnected');
     expect(test.listeners.size).toBe(0);
   });
@@ -254,6 +261,9 @@ describe('serial receive lifecycle', () => {
     const test = harness(mock.port);
     vi.mocked(mock.port.open).mockRejectedValueOnce(new DOMException('busy', 'NetworkError'));
     await test.reader.connect(settings);
+    expect(test.callbacks.onError).toHaveBeenCalledWith(
+      'The serial reader is busy or unavailable. Close other apps using it, check the USB connection, and try again. Details: NetworkError: busy',
+    );
     expect(test.callbacks.onStatus).toHaveBeenLastCalledWith('disconnected');
     expect(test.listeners.size).toBe(0);
     expect(mock.port.close).not.toHaveBeenCalled();
@@ -272,6 +282,9 @@ describe('serial receive lifecycle', () => {
       await test.reader.connect(settings);
       const streams = mock.recover(new DOMException('recoverable', name));
       await vi.waitFor(() => expect(interrupted).toHaveBeenCalledOnce());
+      expect(interrupted).toHaveBeenCalledWith(
+        expect.stringContaining(`Details: ${name}: recoverable`),
+      );
       expect(streams.oldStream?.locked).toBe(false);
       expect(streams.replacement.locked).toBe(true);
       expect(mock.port.close).not.toHaveBeenCalled();
@@ -304,6 +317,9 @@ describe('serial receive lifecycle', () => {
     expect(interrupted).toHaveBeenCalledTimes(3);
     expect(test.callbacks.onError).toHaveBeenLastCalledWith(
       expect.stringContaining('repeatedly failed'),
+    );
+    expect(test.callbacks.onError).toHaveBeenLastCalledWith(
+      expect.stringContaining('Details: FramingError: recoverable'),
     );
     expect(mock.port.close).toHaveBeenCalledOnce();
     expect(mock.port.readable?.locked).toBe(false);
@@ -340,6 +356,110 @@ describe('serial receive lifecycle', () => {
     expect(test.callbacks.onData).not.toHaveBeenCalled();
     expect(test.callbacks.onStatus).toHaveBeenLastCalledWith('disconnected');
   });
+});
+
+describe('serial error diagnostics', () => {
+  it.each([
+    [
+      new DOMException('The operating system rejected this rate.', 'NotSupportedError'),
+      'NotSupportedError: The operating system rejected this rate.',
+    ],
+    [
+      Object.assign(new Error('Driver receive queue unavailable.'), { name: 'DriverError' }),
+      'DriverError: Driver receive queue unavailable.',
+    ],
+    [{ message: 'Native backend failed.' }, 'Native backend failed.'],
+    ['Native backend failed.', 'Native backend failed.'],
+  ])(
+    'preserves available connection error details without inventing a cause',
+    async (cause, details) => {
+      const mock = mockPort();
+      const test = harness(mock.port);
+      vi.mocked(mock.port.open).mockRejectedValueOnce(cause);
+      await test.reader.connect(settings);
+      expect(test.callbacks.onError).toHaveBeenCalledWith(
+        expect.stringContaining(`Details: ${details}`),
+      );
+      expect(test.callbacks.onStatus).toHaveBeenLastCalledWith('disconnected');
+      expect(mock.sent).toEqual([]);
+    },
+  );
+
+  it.each([undefined, null, {}, { name: '', message: '' }])(
+    'omits diagnostic details when the connection failure supplies none (%j)',
+    async (cause) => {
+      const test = harness();
+      vi.mocked(test.api.requestPort).mockRejectedValueOnce(cause);
+      await test.reader.connect(settings);
+      expect(test.callbacks.onError).toHaveBeenCalledWith(
+        'The serial reader could not connect. Check its USB connection and serial settings, then try again.',
+      );
+      expect(test.callbacks.onStatus).toHaveBeenLastCalledWith('disconnected');
+    },
+  );
+
+  it('normalizes control characters, bounds details, and keeps markup as text without exposing a stack', async () => {
+    const test = harness();
+    const cause = Object.assign(
+      new Error(`Driver\r\n\tfailed\u0000\u202E <device> ${'😕'.repeat(400)}`),
+      { name: 'Custom\u001BError', stack: 'not part of diagnostics' },
+    );
+    vi.mocked(test.api.requestPort).mockRejectedValueOnce(cause);
+    await test.reader.connect(settings);
+    const message = vi.mocked(test.callbacks.onError).mock.calls[0][0];
+    const details = message.split(' Details: ')[1];
+    expect(details).toMatch(/^Custom Error: Driver failed <device> /u);
+    expect(details).not.toMatch(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u);
+    expect(Array.from(details)).toHaveLength(320);
+    expect(details).toMatch(/😕…$/u);
+    expect(message).not.toContain(cause.stack);
+  });
+
+  it('includes a native getReader failure while retaining the reconnect guidance', async () => {
+    const mock = mockPort();
+    const test = harness(mock.port);
+    vi.mocked(mock.port.open).mockImplementationOnce(async () => {
+      mock.port.readable = new ReadableStream<Uint8Array>();
+      vi.spyOn(mock.port.readable, 'getReader').mockImplementation(() => {
+        throw new TypeError('ReadableStream is already locked.');
+      });
+    });
+    await test.reader.connect(settings);
+    await vi.waitFor(() =>
+      expect(test.callbacks.onStatus).toHaveBeenLastCalledWith('disconnected'),
+    );
+    expect(test.callbacks.onError).toHaveBeenCalledWith(
+      'The serial input is unavailable or already in use. Reconnect the reader and close other reader apps. Details: TypeError: ReadableStream is already locked.',
+    );
+  });
+
+  it.each([
+    [
+      new DOMException('An operating system error occurred.', 'UnknownError'),
+      ' Details: UnknownError: An operating system error occurred.',
+    ],
+    [
+      Object.assign(new Error('Device input failed.'), { name: 'DriverReadError' }),
+      ' Details: DriverReadError: Device input failed.',
+    ],
+    [undefined, ''],
+  ])(
+    'preserves actual read failure details without fabricating missing ones',
+    async (cause, details) => {
+      const mock = mockPort();
+      const test = harness(mock.port);
+      await test.reader.connect(settings);
+      mock.fail(cause);
+      await vi.waitFor(() =>
+        expect(test.callbacks.onStatus).toHaveBeenLastCalledWith('disconnected'),
+      );
+      expect(test.callbacks.onError).toHaveBeenCalledWith(
+        `Could not read from the serial device. Check its connection and serial settings, then reconnect.${details}`,
+      );
+      expect(mock.port.close).toHaveBeenCalledOnce();
+      expect(mock.sent).toEqual([]);
+    },
+  );
 });
 
 describe('explicit serial line controls', () => {

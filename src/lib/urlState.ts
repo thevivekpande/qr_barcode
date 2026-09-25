@@ -1,5 +1,5 @@
 import type { CodeSettings, CodeType } from './codes';
-import { DEFAULT_RFID_SETTINGS } from './rfidData';
+import { DEFAULT_RFID_SETTINGS, RE422_SERIAL_SETTINGS } from './rfidData';
 import type { RfidSettings } from './rfidData';
 
 export type Mode = 'single' | 'live' | 'batch' | 'scan' | 'rfid';
@@ -225,6 +225,7 @@ export function readWorkspaceUrl(url: URL): WorkspaceState {
     }
   } else if (state.mode === 'rfid') {
     const r = state.rfid;
+    if (query.get('model') === 're422') Object.assign(r, RE422_SERIAL_SETTINGS);
     if (query.get('reader') === 'serial') r.transport = 'serial';
     if (query.get('hidMode') === 'raw') r.hidMode = 'raw';
     const terminator = query.get('terminator');
@@ -265,8 +266,13 @@ function sameSettings(first: CodeSettings, second: CodeSettings): boolean {
 export function buildWorkspaceUrl(state: WorkspaceState): string {
   const query = new URLSearchParams();
   if (state.mode === 'rfid') {
+    const defaults =
+      state.rfid.serialProfile === 're422'
+        ? { ...DEFAULT_RFID_SETTINGS, ...RE422_SERIAL_SETTINGS, serialProfile: 'generic' }
+        : DEFAULT_RFID_SETTINGS;
     const keys: [keyof RfidSettings, string][] = [
       ['transport', 'reader'],
+      ['serialProfile', 'model'],
       ['hidMode', 'hidMode'],
       ['terminator', 'terminator'],
       ['idleMs', 'idleMs'],
@@ -278,8 +284,7 @@ export function buildWorkspaceUrl(state: WorkspaceState): string {
       ['framing', 'framing'],
     ];
     for (const [key, parameter] of keys) {
-      if (state.rfid[key] !== DEFAULT_RFID_SETTINGS[key])
-        query.set(parameter, String(state.rfid[key]));
+      if (state.rfid[key] !== defaults[key]) query.set(parameter, String(state.rfid[key]));
     }
     return `/rfid${query.size ? `?${query.toString()}` : ''}`;
   }

@@ -1,5 +1,6 @@
 export type RfidSettings = {
   transport: 'hid' | 'serial';
+  serialProfile: 'generic' | 're422';
   hidMode: 'keyboard' | 'raw';
   terminator: 'auto' | 'enter' | 'tab' | 'idle';
   idleMs: number;
@@ -13,6 +14,7 @@ export type RfidSettings = {
 
 export const DEFAULT_RFID_SETTINGS: RfidSettings = {
   transport: 'hid',
+  serialProfile: 'generic',
   hidMode: 'keyboard',
   terminator: 'auto',
   idleMs: 150,
@@ -23,6 +25,17 @@ export const DEFAULT_RFID_SETTINGS: RfidSettings = {
   flowControl: 'none',
   framing: 'auto',
 };
+
+/** RE40 binary SDK defaults; a reader reconfigured by its vendor may use another baud. */
+export const RE422_SERIAL_SETTINGS = {
+  serialProfile: 're422',
+  baudRate: 921600,
+  dataBits: 8,
+  stopBits: 1,
+  parity: 'none',
+  flowControl: 'none',
+  framing: 'chunks',
+} as const;
 
 export const MAX_FRAME_BYTES = 4096;
 

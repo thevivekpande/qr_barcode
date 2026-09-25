@@ -22,11 +22,16 @@ import {
   createByteFramer,
   encodeCommand,
   MAX_FRAME_BYTES,
+  RE422_SERIAL_SETTINGS,
 } from '../lib/rfidData';
 import type { RfidSettings } from '../lib/rfidData';
+import { decodeRfHidReport } from '../lib/rfidProtocol';
 import { createHidReader, hidSupported } from '../lib/rfidHid';
 import { createSerialReader, serialSupported } from '../lib/rfidSerial';
 import type { SerialStatus } from '../lib/rfidSerial';
+import { createRe40Session } from '../lib/rfidRe40Session';
+import type { Re40State } from '../lib/rfidRe40Session';
+import type { Re40Tag } from '../lib/rfidRe40';
 import { createMemorySession } from '../lib/rfidMemory';
 import type { MemoryProfile, MemoryState } from '../lib/rfidMemory';
 import RfidMemory from './RfidMemory';
@@ -85,6 +90,8 @@ export default function RfidLab({
   const [reportId, setReportId] = useState('0');
   const [sending, setSending] = useState(false);
   const [memoryState, setMemoryState] = useState<MemoryState>({ phase: 'idle', message: '' });
+  const [re40State, setRe40State] = useState<Re40State>({ phase: 'idle', message: '' });
+  const [re40Tags, setRe40Tags] = useState<Re40Tag[]>([]);
   const [latestInput, setLatestInput] = useState<LatestInput | null>(null);
   const [readerValue, setReaderValue] = useState<
     { bytes: Uint8Array; description: string } | undefined
@@ -105,12 +112,14 @@ export default function RfidLab({
   const keyboardOverflow = useRef(false);
   const keyboardTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const serialTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastSerialInputAt = useRef<number | null>(null);
   const framer = useRef(createByteFramer(settings.framing));
   const sequence = useRef(0);
   const operation = useRef(0);
   const hid = useRef<ReturnType<typeof createHidReader> | null>(null);
   const serial = useRef<ReturnType<typeof createSerialReader> | null>(null);
   const memorySession = useRef<ReturnType<typeof createMemorySession> | null>(null);
+  const re40Session = useRef<ReturnType<typeof createRe40Session> | null>(null);
   const memoryTarget = useRef<MemoryReports & { transport: 'hid' | 'serial' }>({
     transport: 'serial',
     inputReportId: 0,
@@ -119,8 +128,10 @@ export default function RfidLab({
   const connectionStatus = useRef<SerialStatus>('disconnected');
   const memoryActive = ['reading', 'writing', 'verifying'].includes(memoryState.phase);
   const keyboard = settings.transport === 'hid' && settings.hidMode === 'keyboard';
+  const re422 = settings.transport === 'serial' && settings.serialProfile === 're422';
   const busy = listening || status !== 'disconnected';
   const supported = settings.transport === 'serial' ? serialSupported() : hidSupported();
+  const decodedInput = latestInput?.source === 'hid' ? decodeRfHidReport(latestInput.bytes) : null;
 
   function resetInput() {
     if (keyboardTimer.current) clearTimeout(keyboardTimer.current);
@@ -132,6 +143,7 @@ export default function RfidLab({
   function resetFraming() {
     if (serialTimer.current) clearTimeout(serialTimer.current);
     serialTimer.current = null;
+    lastSerialInputAt.current = null;
     framer.current.reset();
     if (mounted.current) setPending(0);
   }
@@ -180,6 +192,8 @@ export default function RfidLab({
     if (
       !keyboardActive.current ||
       !mounted.current ||
+      document.hidden ||
+      !document.hasFocus() ||
       document.activeElement !== readerInput.current
     )
       return;
@@ -234,10 +248,34 @@ export default function RfidLab({
       },
     });
     memorySession.current = memory;
+    const re40 = createRe40Session({
+      send: async (bytes) => {
+        if (!mounted.current || connectionStatus.current !== 'connected')
+          throw new Error('Connect the RE422 before identifying it.');
+        const token = operation.current;
+        await serial.current!.send(bytes);
+        if (mounted.current && token === operation.current) record(bytes, 'serial', 'sent');
+      },
+      onState: (next) => {
+        if (mounted.current) setRe40State(next);
+      },
+      onTag: (tag) => {
+        if (mounted.current)
+          setRe40Tags((previous) =>
+            [tag, ...previous.filter((item) => item.epc !== tag.epc)].slice(0, 100),
+          );
+      },
+      onFault: (message) => {
+        if (mounted.current) setError(message);
+        void serial.current?.disconnect();
+      },
+    });
+    re40Session.current = re40;
     const onStatus = (next: SerialStatus) => {
       if (!mounted.current) return;
       connectionStatus.current = next;
       if (next !== 'connected') memory.cancel('The reader session ended.');
+      if (next !== 'connected') re40.reset();
       setStatus(next);
       if (next === 'disconnected') {
         setDevice(null);
@@ -276,20 +314,42 @@ export default function RfidLab({
         if (!mounted.current) return;
         resetFraming();
         memory.cancel('A serial read error interrupted the memory response.');
+        if (settingsRef.current.serialProfile === 're422') {
+          re40.reset();
+          setError('The RE422 response was interrupted. Reconnect before identifying it again.');
+          void serial.current?.disconnect();
+        }
         setNotice(message);
       },
       onData: (bytes) => {
         if (!mounted.current) return;
         observeInput(bytes, 'serial');
+        if (settingsRef.current.serialProfile === 're422') re40.receive(bytes);
         if (memoryTarget.current.transport === 'serial') memory.receive(bytes);
         setReceivedBytes((value) => value + bytes.length);
+        const usesIdleGap =
+          settingsRef.current.framing === 'idle' || settingsRef.current.framing === 'auto';
+        const arrivedAt = performance.now();
+        // A background tab's timer may be overdue when the next chunk arrives.
+        // Respect the elapsed gap before appending it to the previous frame.
+        if (
+          usesIdleGap &&
+          lastSerialInputAt.current !== null &&
+          arrivedAt - lastSerialInputAt.current >= settingsRef.current.idleMs
+        ) {
+          const frame = framer.current.flush();
+          if (frame) record(frame, 'serial', 'received');
+        }
         for (const frame of framer.current.push(bytes)) record(frame, 'serial', 'received');
         setPending(framer.current.pendingBytes);
         if (framer.current.takeOverflow())
           setError('A frame exceeded 4,096 bytes and was discarded. Check the receive framing.');
-        if (settingsRef.current.framing === 'idle' || settingsRef.current.framing === 'auto') {
+        if (usesIdleGap) {
+          lastSerialInputAt.current = arrivedAt;
           if (serialTimer.current) clearTimeout(serialTimer.current);
           serialTimer.current = setTimeout(() => {
+            serialTimer.current = null;
+            lastSerialInputAt.current = null;
             const frame = framer.current.flush();
             if (frame) record(frame, 'serial', 'received');
             if (mounted.current) setPending(0);
@@ -302,25 +362,30 @@ export default function RfidLab({
     const release = () => {
       operation.current++;
       memory.cancel('The reader session ended.');
+      re40.reset();
       stopKeyboard();
       resetFraming();
       void hidReader.disconnect();
       void serialReader.disconnect();
     };
-    const onHidden = () => {
-      if (document.hidden) {
-        release();
-        setNotice(
-          'Testing stopped while this tab was hidden. Reconnect or start a new keyboard test when ready.',
-        );
-      }
+    const updateKeyboardFocus = () => {
+      const canCapture =
+        !document.hidden && document.hasFocus() && document.activeElement === readerInput.current;
+      if (!canCapture) resetInput();
+      setFocused(canCapture);
     };
-    document.addEventListener('visibilitychange', onHidden);
+    // Hiding a page is not leaving the lab. Keep the user's USB session open
+    // and keyboard test armed; keystrokes still require this visible field.
+    document.addEventListener('visibilitychange', updateKeyboardFocus);
+    window.addEventListener('focus', updateKeyboardFocus);
+    window.addEventListener('blur', updateKeyboardFocus);
     window.addEventListener('pagehide', release);
     return () => {
       mounted.current = false;
       release();
-      document.removeEventListener('visibilitychange', onHidden);
+      document.removeEventListener('visibilitychange', updateKeyboardFocus);
+      window.removeEventListener('focus', updateKeyboardFocus);
+      window.removeEventListener('blur', updateKeyboardFocus);
       window.removeEventListener('pagehide', release);
     };
   }, []);
@@ -346,6 +411,8 @@ export default function RfidLab({
     setNotice('');
     setDevice(null);
     setMemoryState({ phase: 'idle', message: '' });
+    re40Session.current?.reset();
+    setRe40Tags([]);
     setLatestInput(null);
     setReaderValue(undefined);
     resetInput();
@@ -380,6 +447,7 @@ export default function RfidLab({
     setMemoryState({ phase: 'idle', message: '' });
     setLatestInput(null);
     setReaderValue(undefined);
+    setRe40Tags([]);
     setDtr('unchanged');
     setRts('unchanged');
     resetFraming();
@@ -391,8 +459,10 @@ export default function RfidLab({
     } else void hid.current?.connect();
   }
   async function disconnect() {
+    if (re40Session.current?.state.phase === 'inventory') await re40Session.current.stop();
     operation.current++;
     memorySession.current?.cancel('The reader was disconnected.');
+    re40Session.current?.reset();
     resetFraming();
     await Promise.all([hid.current?.disconnect(), serial.current?.disconnect()]);
   }
@@ -419,7 +489,14 @@ export default function RfidLab({
     setListening(true);
   }
   async function applySignals() {
-    if (status !== 'connected' || sending || applyingSignals || memorySession.current?.busy) return;
+    if (
+      status !== 'connected' ||
+      sending ||
+      applyingSignals ||
+      memorySession.current?.busy ||
+      re40Session.current?.busy
+    )
+      return;
     const token = operation.current;
     setError('');
     setApplyingSignals(true);
@@ -441,7 +518,14 @@ export default function RfidLab({
     }
   }
   async function send() {
-    if (sending || applyingSignals || memorySession.current?.busy || status !== 'connected') return;
+    if (
+      re422 ||
+      sending ||
+      applyingSignals ||
+      memorySession.current?.busy ||
+      status !== 'connected'
+    )
+      return;
     setError('');
     const token = operation.current;
     const source = settings.transport;
@@ -467,6 +551,7 @@ export default function RfidLab({
   }
   function readMemory(profile: MemoryProfile, reports: MemoryReports) {
     if (
+      re422 ||
       sending ||
       applyingSignals ||
       memorySession.current?.busy ||
@@ -479,6 +564,7 @@ export default function RfidLab({
   }
   function writeMemory(profile: MemoryProfile, bytes: Uint8Array, reports: MemoryReports) {
     if (
+      re422 ||
       sending ||
       applyingSignals ||
       memorySession.current?.busy ||
@@ -506,6 +592,7 @@ export default function RfidLab({
     setSent(0);
     setLatestInput(null);
     setReaderValue(undefined);
+    setRe40Tags([]);
     setError('');
   }
   function exportLog() {
@@ -620,6 +707,30 @@ export default function RfidLab({
                 </>
               ) : (
                 <>
+                  <label className="rfid-field">
+                    Serial reader model
+                    <select
+                      aria-label="Serial reader model"
+                      value={settings.serialProfile}
+                      onChange={(event) => {
+                        if (event.target.value === 're422') {
+                          setCustomBaud(false);
+                          update(RE422_SERIAL_SETTINGS);
+                        } else update({ serialProfile: 'generic' });
+                      }}
+                    >
+                      <option value="generic">Generic serial reader</option>
+                      <option value="re422">RE422 / RE40 (binary)</option>
+                    </select>
+                  </label>
+                  {re422 && (
+                    <p className="rfid-hint">
+                      Uses the RE40 binary protocol. The preset is 921,600 baud, 8 data bits, 1 stop
+                      bit, no parity or flow control. Identify the reader after connecting, then
+                      start inventory to read tags. Change the baud rate only if your reader was
+                      configured differently.
+                    </p>
+                  )}
                   <div className="rfid-fields">
                     <label className="rfid-field">
                       Baud rate
@@ -784,13 +895,14 @@ export default function RfidLab({
                         ? 'Tap a tag with this field focused…'
                         : 'Start the test to capture a tag'
                     }
-                    onFocus={() => setFocused(true)}
+                    onFocus={() => setFocused(!document.hidden && document.hasFocus())}
                     onBlur={() => {
                       setFocused(false);
                       resetInput();
                     }}
                     onChange={(event) => {
-                      if (!keyboardActive.current) return;
+                      if (!keyboardActive.current || document.hidden || !document.hasFocus())
+                        return;
                       const value = event.target.value;
                       if (new TextEncoder().encode(value).length > MAX_FRAME_BYTES) {
                         keyboardOverflow.current = true;
@@ -879,6 +991,55 @@ export default function RfidLab({
                 <p className="rfid-hint rfid-connect-hint">
                   Choose your reader in the browser’s device picker. Nothing is sent on connection.
                 </p>
+                {re422 && (
+                  <div className="rfid-re40" aria-label="RE422 controls">
+                    <strong>RE422 tag reader</strong>
+                    <p className="rfid-hint">
+                      A connected port is the first step. Identify reader checks whether the RE40
+                      binary protocol responds at the selected baud rate.
+                    </p>
+                    <button
+                      className="secondary-button"
+                      disabled={
+                        status !== 'connected' || !['idle', 'ready'].includes(re40State.phase)
+                      }
+                      onClick={() => {
+                        setError('');
+                        void re40Session.current?.identify();
+                      }}
+                    >
+                      {re40State.phase === 'identifying' ? 'Identifying…' : 'Identify reader'}
+                    </button>
+                    <button
+                      className="primary-button"
+                      disabled={
+                        status !== 'connected' || !['ready', 'inventory'].includes(re40State.phase)
+                      }
+                      onClick={() => {
+                        setError('');
+                        if (re40State.phase === 'inventory') void re40Session.current?.stop();
+                        else {
+                          setRe40Tags([]);
+                          void re40Session.current?.scan();
+                        }
+                      }}
+                    >
+                      {re40State.phase === 'inventory'
+                        ? 'Stop inventory'
+                        : 'Read tags for 5 seconds'}
+                    </button>
+                    <p className="rfid-hint">
+                      Each scan stops automatically. Uses the reader’s current antenna, power and
+                      region settings. This profile reads EPC identifiers; tag-memory writing
+                      requires a separate reader-specific command profile in Generic serial mode.
+                    </p>
+                    {re40State.message && (
+                      <p className="rfid-hint" role="status" data-testid="rfid-re40-status">
+                        {re40State.message}
+                      </p>
+                    )}
+                  </div>
+                )}
                 {settings.transport === 'hid' && (
                   <div className="rfid-hid-help">
                     <p className="rfid-hint">
@@ -905,7 +1066,9 @@ export default function RfidLab({
                   <p className="rfid-support" role="status">
                     No input received yet.{' '}
                     {settings.transport === 'serial'
-                      ? 'Check the selected port and the reader’s baud rate and flow control. Some readers also require line signals or a documented polling command.'
+                      ? re422
+                        ? 'Click Identify reader to test the RE40 binary connection. This reader needs an inventory command to send tag data.'
+                        : 'Check the selected port and the reader’s baud rate and flow control. Some readers also require line signals or a documented polling command.'
                       : 'Try Test keyboard input if scanning types text. A raw HID connection alone does not start reading tags; some devices need a documented command.'}
                   </p>
                 )}
@@ -923,6 +1086,7 @@ export default function RfidLab({
                   </p>
                 )}
                 {settings.transport === 'serial' &&
+                  !re422 &&
                   status === 'connected' &&
                   device?.supportsSignals && (
                     <details className="rfid-signals">
@@ -1056,6 +1220,49 @@ export default function RfidLab({
               </button>
             </div>
           </div>
+          {re422 && re40Tags.length > 0 && (
+            <div className="rfid-decoded-input" data-testid="rfid-re40-tags">
+              <strong>RE422 tag EPCs</strong>
+              {re40Tags.map((tag) => (
+                <div className="rfid-decoded-value" key={tag.epc}>
+                  <code>{tag.epc}</code>
+                  <button
+                    className="text-button"
+                    aria-label={`Copy EPC ${tag.epc}`}
+                    onClick={() => void copy(tag.epc, `epc-${tag.epc}`)}
+                  >
+                    {copied === `epc-${tag.epc}` ? 'Copied' : 'Copy EPC'}
+                  </button>
+                </div>
+              ))}
+              <p>
+                Latest {re40Tags.length} unique identifiers from this scan. Raw reader responses
+                remain in the log.
+              </p>
+            </div>
+          )}
+          {decodedInput && (
+            <div className="rfid-decoded-input" data-testid="rfid-decoded-input">
+              <strong>Decoded tag EPC</strong>
+              {decodedInput.epcs.map((epc, index) => (
+                <div className="rfid-decoded-value" key={`${index}-${epc}`}>
+                  <code data-testid="rfid-decoded-epc">{epc}</code>
+                  <button
+                    className="text-button"
+                    aria-label={`Copy EPC ${index + 1}`}
+                    onClick={() => void copy(epc, `epc-${epc}`)}
+                  >
+                    {copied === `epc-${epc}` ? <Check size={13} /> : <Copy size={13} />}
+                    {copied === `epc-${epc}` ? 'Copied' : 'Copy EPC'}
+                  </button>
+                </div>
+              ))}
+              <p>
+                RF inventory report · checksum valid. EPC is the tag identifier; tag memory
+                operations use the separate panel below.
+              </p>
+            </div>
+          )}
           {latestInput && (
             <details
               className="rfid-raw-input"
@@ -1071,6 +1278,7 @@ export default function RfidLab({
               <code>{bytesToHex(latestInput.bytes) || '—'}</code>
               <p>
                 Raw bytes before framing or memory decoding.
+                {decodedInput && ' This binary report contains the EPC shown above.'}
                 {latestInput.total > MAX_FRAME_BYTES &&
                   ' Preview limited to the first 4,096 bytes.'}
               </p>
@@ -1171,28 +1379,30 @@ export default function RfidLab({
           {notice}
         </p>
       )}
-      <RfidMemory
-        keyboard={keyboard}
-        transport={settings.transport}
-        connected={status === 'connected'}
-        unavailable={sending || applyingSignals}
-        inputReportIds={device?.inputReportIds ?? []}
-        outputReportIds={device?.outputReportIds ?? []}
-        readerValue={readerValue}
-        keyboardValue={
-          entries.find((entry) => entry.source === 'keyboard' && entry.direction === 'received')
-            ?.text
-        }
-        state={memoryState}
-        onRead={readMemory}
-        onWrite={writeMemory}
-        onCancel={() =>
-          memorySession.current?.cancel(
-            'Operation canceled. A command already sent cannot be recalled.',
-          )
-        }
-      />
-      {!keyboard && (
+      {!re422 && (
+        <RfidMemory
+          keyboard={keyboard}
+          transport={settings.transport}
+          connected={status === 'connected'}
+          unavailable={sending || applyingSignals}
+          inputReportIds={device?.inputReportIds ?? []}
+          outputReportIds={device?.outputReportIds ?? []}
+          readerValue={readerValue}
+          keyboardValue={
+            entries.find((entry) => entry.source === 'keyboard' && entry.direction === 'received')
+              ?.text
+          }
+          state={memoryState}
+          onRead={readMemory}
+          onWrite={writeMemory}
+          onCancel={() =>
+            memorySession.current?.cancel(
+              'Operation canceled. A command already sent cannot be recalled.',
+            )
+          }
+        />
+      )}
+      {!keyboard && !re422 && (
         <section className="panel rfid-command" aria-labelledby="rfid-command-title">
           <div className="panel-heading">
             <div className="panel-title">
