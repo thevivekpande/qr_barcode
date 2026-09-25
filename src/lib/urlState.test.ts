@@ -14,6 +14,36 @@ const read = (path: string) => readWorkspaceUrl(new URL(path, base));
 const roundTrip = (state: WorkspaceState) => read(buildWorkspaceUrl(state));
 
 describe('workspace URLs', () => {
+  it('restores only RFID configuration without reconnecting or serializing reader data', () => {
+    const state = createDefaultState();
+    state.mode = 'rfid';
+    state.rfid = {
+      transport: 'serial',
+      hidMode: 'raw',
+      terminator: 'idle',
+      idleMs: 250,
+      baudRate: 115200,
+      dataBits: 7,
+      stopBits: 2,
+      parity: 'even',
+      flowControl: 'hardware',
+      framing: 'chunks',
+    };
+    expect(roundTrip(state)).toEqual(state);
+    state.scan = { text: 'private scan', format: 'QR_CODE' };
+    state.text = 'private draft';
+    expect(buildWorkspaceUrl(state)).not.toContain('private');
+    expect(read('/rfid?reader=serial&connected=true&command=erase&tag=12345').rfid.transport).toBe(
+      'serial',
+    );
+    expect(buildWorkspaceUrl(read('/rfid?tag=12345&connected=true'))).toBe('/rfid');
+  });
+  it('rejects invalid RFID options from shared links', () => {
+    const state = read(
+      '/rfid?reader=bad&hidMode=bad&idleMs=1&baud=Infinity&dataBits=9&stopBits=5&parity=bad&flow=bad&framing=bad',
+    );
+    expect(state.rfid).toEqual(createDefaultState().rfid);
+  });
   it('opens the example QR on the root, single route, and unknown routes', () => {
     for (const path of ['/', '/single', '/single/', '/default', '/unknown/route']) {
       const state = read(path);
