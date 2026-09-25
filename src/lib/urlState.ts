@@ -1,6 +1,8 @@
 import type { CodeSettings, CodeType } from './codes';
+import { DEFAULT_RFID_SETTINGS, RE422_SERIAL_SETTINGS } from './rfidData';
+import type { RfidSettings } from './rfidData';
 
-export type Mode = 'single' | 'live' | 'batch' | 'scan';
+export type Mode = 'single' | 'live' | 'batch' | 'scan' | 'rfid';
 
 export type CodeSnapshot = {
   text: string;
@@ -29,6 +31,7 @@ export type WorkspaceState = {
   live: CodeSnapshot | null;
   batch: BatchSnapshot | null;
   scan: { text: string; format: string } | null;
+  rfid: RfidSettings;
 };
 
 export const DEFAULT_SETTINGS: CodeSettings = {
@@ -63,6 +66,7 @@ export function createDefaultState(): WorkspaceState {
     live: null,
     batch: null,
     scan: null,
+    rfid: { ...DEFAULT_RFID_SETTINGS },
   };
 }
 
@@ -173,7 +177,15 @@ export function readWorkspaceUrl(url: URL): WorkspaceState {
   const state = createDefaultState();
   const path = url.pathname.replace(/\/$/, '');
   state.mode =
-    path === '/live' ? 'live' : path === '/batch' ? 'batch' : path === '/scan' ? 'scan' : 'single';
+    path === '/rfid'
+      ? 'rfid'
+      : path === '/live'
+        ? 'live'
+        : path === '/batch'
+          ? 'batch'
+          : path === '/scan'
+            ? 'scan'
+            : 'single';
   // Large drafts and collections live in the fragment, which is not sent in HTTP requests.
   // An incomplete fragment link must not accidentally restore unrelated query parameters.
   const query =
@@ -206,11 +218,36 @@ export function readWorkspaceUrl(url: URL): WorkspaceState {
   } else if (state.mode === 'batch') {
     state.batchInput = query.get('input') ?? state.batchInput;
     state.batch = readBatchSnapshot(readJson(query.get('preview')));
-  } else {
+  } else if (state.mode === 'scan') {
     const result = readJson(query.get('result'));
     if (isRecord(result) && typeof result.text === 'string' && typeof result.format === 'string') {
       state.scan = { text: result.text, format: result.format };
     }
+  } else if (state.mode === 'rfid') {
+    const r = state.rfid;
+    if (query.get('model') === 're422') Object.assign(r, RE422_SERIAL_SETTINGS);
+    if (query.get('reader') === 'serial') r.transport = 'serial';
+    if (query.get('hidMode') === 'raw') r.hidMode = 'raw';
+    const terminator = query.get('terminator');
+    if (
+      terminator === 'auto' ||
+      terminator === 'enter' ||
+      terminator === 'tab' ||
+      terminator === 'idle'
+    )
+      r.terminator = terminator;
+    r.idleMs = Number(readNumberDraft(query.get('idleMs'), String(r.idleMs), 50, 2000, true));
+    r.baudRate = Number(
+      readNumberDraft(query.get('baud'), String(r.baudRate), 50, 4_000_000, true),
+    );
+    if (query.get('dataBits') === '7') r.dataBits = 7;
+    if (query.get('stopBits') === '2') r.stopBits = 2;
+    const parity = query.get('parity');
+    if (parity === 'even' || parity === 'odd') r.parity = parity;
+    if (query.get('flow') === 'hardware') r.flowControl = 'hardware';
+    const framing = query.get('framing');
+    if (framing === 'auto' || framing === 'lines' || framing === 'idle' || framing === 'chunks')
+      r.framing = framing;
   }
   return state;
 }
@@ -228,6 +265,29 @@ function sameSettings(first: CodeSettings, second: CodeSettings): boolean {
 /** Returns a relative URL and deliberately excludes inactive workspace drafts. */
 export function buildWorkspaceUrl(state: WorkspaceState): string {
   const query = new URLSearchParams();
+  if (state.mode === 'rfid') {
+    const defaults =
+      state.rfid.serialProfile === 're422'
+        ? { ...DEFAULT_RFID_SETTINGS, ...RE422_SERIAL_SETTINGS, serialProfile: 'generic' }
+        : DEFAULT_RFID_SETTINGS;
+    const keys: [keyof RfidSettings, string][] = [
+      ['transport', 'reader'],
+      ['serialProfile', 'model'],
+      ['hidMode', 'hidMode'],
+      ['terminator', 'terminator'],
+      ['idleMs', 'idleMs'],
+      ['baudRate', 'baud'],
+      ['dataBits', 'dataBits'],
+      ['stopBits', 'stopBits'],
+      ['parity', 'parity'],
+      ['flowControl', 'flow'],
+      ['framing', 'framing'],
+    ];
+    for (const [key, parameter] of keys) {
+      if (state.rfid[key] !== defaults[key]) query.set(parameter, String(state.rfid[key]));
+    }
+    return `/rfid${query.size ? `?${query.toString()}` : ''}`;
+  }
   if (state.codeType !== 'qr') query.set('type', state.codeType);
   if (state.settings.size !== DEFAULT_SETTINGS.size) query.set('size', String(state.settings.size));
   if (state.settings.foreground !== DEFAULT_SETTINGS.foreground) {

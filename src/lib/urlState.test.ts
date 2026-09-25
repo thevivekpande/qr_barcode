@@ -14,6 +14,83 @@ const read = (path: string) => readWorkspaceUrl(new URL(path, base));
 const roundTrip = (state: WorkspaceState) => read(buildWorkspaceUrl(state));
 
 describe('workspace URLs', () => {
+  it('defaults RFID capture to automatic framing and preserves explicitly chosen terminators', () => {
+    expect(read('/rfid').rfid).toMatchObject({ terminator: 'auto', framing: 'auto' });
+    for (const terminator of ['auto', 'enter', 'tab', 'idle'] as const) {
+      const state = read(`/rfid?terminator=${terminator}&framing=lines`);
+      expect(state.rfid).toMatchObject({ terminator, framing: 'lines' });
+      expect(roundTrip(state).rfid).toEqual(state.rfid);
+    }
+  });
+  it('restores only RFID configuration without reconnecting or serializing reader data', () => {
+    const state = createDefaultState();
+    state.mode = 'rfid';
+    state.rfid = {
+      transport: 'serial',
+      serialProfile: 'generic',
+      hidMode: 'raw',
+      terminator: 'idle',
+      idleMs: 250,
+      baudRate: 115200,
+      dataBits: 7,
+      stopBits: 2,
+      parity: 'even',
+      flowControl: 'hardware',
+      framing: 'chunks',
+    };
+    expect(roundTrip(state)).toEqual(state);
+    state.scan = { text: 'private scan', format: 'QR_CODE' };
+    state.text = 'private draft';
+    expect(buildWorkspaceUrl(state)).not.toContain('private');
+    expect(read('/rfid?reader=serial&connected=true&command=erase&tag=12345').rfid.transport).toBe(
+      'serial',
+    );
+    expect(buildWorkspaceUrl(read('/rfid?tag=12345&connected=true'))).toBe('/rfid');
+  });
+  it('rejects invalid RFID options from shared links', () => {
+    const state = read(
+      '/rfid?reader=bad&model=bad&hidMode=bad&idleMs=1&baud=Infinity&dataBits=9&stopBits=5&parity=bad&flow=bad&framing=bad',
+    );
+    expect(state.rfid).toEqual(createDefaultState().rfid);
+  });
+  it('restores a compact RE422 link with the binary reader preset', () => {
+    const state = read('/rfid?reader=serial&model=re422');
+    expect(state.rfid).toMatchObject({
+      transport: 'serial',
+      serialProfile: 're422',
+      baudRate: 921600,
+      dataBits: 8,
+      stopBits: 1,
+      parity: 'none',
+      flowControl: 'none',
+      framing: 'chunks',
+    });
+    expect(buildWorkspaceUrl(state)).toBe('/rfid?reader=serial&model=re422');
+    expect(roundTrip(state)).toEqual(state);
+    expect(read('/rfid?reader=serial').rfid).toMatchObject({
+      serialProfile: 'generic',
+      baudRate: 9600,
+      framing: 'auto',
+    });
+  });
+  it('preserves explicit serial overrides relative to RE422 preset defaults', () => {
+    const state = read('/rfid?reader=serial&model=re422');
+    state.rfid.baudRate = 9600;
+    state.rfid.framing = 'auto';
+    state.rfid.parity = 'even';
+    const url = new URL(buildWorkspaceUrl(state), base);
+    expect(url.searchParams.get('model')).toBe('re422');
+    expect(url.searchParams.get('baud')).toBe('9600');
+    expect(url.searchParams.get('framing')).toBe('auto');
+    expect(roundTrip(state).rfid).toEqual(state.rfid);
+    expect(read('/rfid?reader=serial&model=re422&baud=invalid&framing=invalid').rfid).toMatchObject(
+      {
+        serialProfile: 're422',
+        baudRate: 921600,
+        framing: 'chunks',
+      },
+    );
+  });
   it('opens the example QR on the root, single route, and unknown routes', () => {
     for (const path of ['/', '/single', '/single/', '/default', '/unknown/route']) {
       const state = read(path);

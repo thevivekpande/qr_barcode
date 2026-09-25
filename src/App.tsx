@@ -27,21 +27,29 @@ import {
   ShieldCheck,
   Sparkles,
   WandSparkles,
+  Usb,
   X,
   Zap,
 } from 'lucide-react';
 import { downloadCode, exportPdf, generateCode, parseBatchInput, randomText } from './lib/codes';
 import type { CodeSettings, CodeType, GeneratedCode } from './lib/codes';
 import type { ScanResult } from './lib/scanner';
+import type { RfidSettings } from './lib/rfidData';
 import { buildWorkspaceUrl, readWorkspaceUrl, DEFAULT_BATCH } from './lib/urlState';
 import type { Mode, WorkspaceState, CodeSnapshot } from './lib/urlState';
 
 const Scanner = lazy(() => import('./components/Scanner'));
+const RfidLab = lazy(() => import('./components/RfidLab'));
 
 const snapshotOf = (code: GeneratedCode | null): CodeSnapshot | null =>
   code ? { text: code.text, type: code.type, settings: code.settings } : null;
 
 const pages = {
+  rfid: {
+    label: 'RFID lab',
+    title: 'Tap a tag. Know it works.',
+    description: 'Connect your USB reader and see what comes through.',
+  },
   scan: {
     label: 'Scan codes',
     title: 'Every code has a story.',
@@ -93,6 +101,8 @@ function App() {
   const [nextAt, setNextAt] = useState(0);
   const [now, setNow] = useState(Date.now());
   const [scanResult, setScanResult] = useState<ScanResult | null>(initial.scan);
+  const [rfidSettings, setRfidSettings] = useState<RfidSettings>(initial.rfid);
+  const [rfidSession, setRfidSession] = useState(0);
   const [restoring, setRestoring] = useState(true);
   const [urlError, setUrlError] = useState('');
   const operation = useRef(0);
@@ -133,6 +143,10 @@ function App() {
         setLiveCount(0);
       }
       if (initialLoad || state.mode === 'scan') setScanResult(state.scan);
+      if (initialLoad || state.mode === 'rfid') {
+        setRfidSettings(state.rfid);
+        setRfidSession((value) => value + 1);
+      }
       setError('');
       setNotice('');
       try {
@@ -160,7 +174,7 @@ function App() {
         if ((initialLoad || state.mode === 'batch') && batch.status === 'fulfilled')
           setBatchCodes(batch.value);
         const active = state.mode === 'live' ? live : state.mode === 'batch' ? batch : single;
-        if (state.mode !== 'scan' && active.status === 'rejected')
+        if (state.mode !== 'scan' && state.mode !== 'rfid' && active.status === 'rejected')
           setError(friendlyError(active.reason));
       } finally {
         if (!disposed && request === operation.current) {
@@ -203,6 +217,7 @@ function App() {
           }
         : null,
       scan: scanResult,
+      rfid: rfidSettings,
     };
   }
 
@@ -236,6 +251,7 @@ function App() {
     liveCode,
     batchCodes,
     scanResult,
+    rfidSettings,
     restoring,
   ]);
 
@@ -243,7 +259,11 @@ function App() {
     try {
       const link = new URL(buildWorkspaceUrl(workspaceState()), window.location.origin).href;
       await navigator.clipboard.writeText(link);
-      setNotice('Workspace link copied, including your content and settings.');
+      setNotice(
+        mode === 'rfid'
+          ? 'Reader settings link copied. Captured data and commands are not included.'
+          : 'Workspace link copied, including your content and settings.',
+      );
     } catch {
       setNotice('Could not copy the link. You can copy it from the address bar.');
     }
@@ -487,6 +507,15 @@ function App() {
             <span>Scan codes</span>
             {mode === 'scan' && <span className="nav-dot" />}
           </button>
+          <button
+            className={`nav-item ${mode === 'rfid' ? 'active' : ''}`}
+            onClick={() => navigate('rfid')}
+            aria-current={mode === 'rfid' ? 'page' : undefined}
+          >
+            <Usb size={19} />
+            <span>RFID lab</span>
+            {mode === 'rfid' && <span className="nav-dot" />}
+          </button>
         </nav>
         <div className="sidebar-bottom">
           <div className="sidebar-note">
@@ -562,7 +591,21 @@ function App() {
               {urlError}
             </div>
           )}
-          {mode === 'scan' ? (
+          {mode === 'rfid' ? (
+            <Suspense
+              fallback={
+                <div className="panel scanner-loading" role="status">
+                  <LoaderCircle className="spin" size={20} /> Loading RFID lab…
+                </div>
+              }
+            >
+              <RfidLab
+                key={rfidSession}
+                settings={rfidSettings}
+                onSettingsChange={setRfidSettings}
+              />
+            </Suspense>
+          ) : mode === 'scan' ? (
             <Suspense
               fallback={
                 <div className="panel scanner-loading" role="status">
@@ -1143,72 +1186,76 @@ function App() {
               </section>
             </>
           )}
-          <section className="recent-section" aria-labelledby="recent-title">
-            <div className="recent-heading">
-              <div>
-                <h2 id="recent-title">Fresh from your studio</h2>
-                <span>This session, just for you.</span>
-              </div>
-              {recent.length > 0 && (
-                <button
-                  className="text-button"
-                  onClick={() => {
-                    setRecent([]);
-                    setNotice('Recent creations cleared.');
-                  }}
-                >
-                  Clear recent <X size={12} />
-                </button>
-              )}
-            </div>
-            {recent.length > 0 ? (
-              <div className="recent-grid">
-                {recent.map((code) => (
+          {mode !== 'rfid' && (
+            <section className="recent-section" aria-labelledby="recent-title">
+              <div className="recent-heading">
+                <div>
+                  <h2 id="recent-title">Fresh from your studio</h2>
+                  <span>This session, just for you.</span>
+                </div>
+                {recent.length > 0 && (
                   <button
-                    className="recent-card"
-                    key={code.id}
+                    className="text-button"
                     onClick={() => {
-                      setSingleCode(code);
-                      setText(code.text);
-                      setCodeType(code.type);
-                      setSettings({ ...code.settings });
-                      navigate('single');
-                      setNotice('Opened your recent code.');
+                      setRecent([]);
+                      setNotice('Recent creations cleared.');
                     }}
                   >
-                    <span className="recent-code-image">
-                      <img src={code.dataUrl} alt="" />
-                    </span>
-                    <span className="recent-card-info">
-                      <strong>{code.text}</strong>
-                      <span>
-                        {code.type === 'qr' ? 'QR CODE' : 'BARCODE'} <span>·</span>{' '}
-                        {new Date(code.createdAt).toLocaleTimeString([], {
-                          hour: '2-digit',
-                          minute: '2-digit',
-                        })}
-                      </span>
-                    </span>
-                    <ArrowUpRight size={16} />
+                    Clear recent <X size={12} />
                   </button>
-                ))}
+                )}
               </div>
-            ) : (
-              <div className="recent-empty">
-                <span>
-                  <Grid2X2 size={18} /> A blank canvas, for now.
-                </span>
-                <p>Your recent creations will feel right at home here.</p>
-                <span className="recent-empty-end">
-                  GO MAKE SOMETHING <ArrowUpRight size={13} />
-                </span>
-              </div>
-            )}
-          </section>
+              {recent.length > 0 ? (
+                <div className="recent-grid">
+                  {recent.map((code) => (
+                    <button
+                      className="recent-card"
+                      key={code.id}
+                      onClick={() => {
+                        setSingleCode(code);
+                        setText(code.text);
+                        setCodeType(code.type);
+                        setSettings({ ...code.settings });
+                        navigate('single');
+                        setNotice('Opened your recent code.');
+                      }}
+                    >
+                      <span className="recent-code-image">
+                        <img src={code.dataUrl} alt="" />
+                      </span>
+                      <span className="recent-card-info">
+                        <strong>{code.text}</strong>
+                        <span>
+                          {code.type === 'qr' ? 'QR CODE' : 'BARCODE'} <span>·</span>{' '}
+                          {new Date(code.createdAt).toLocaleTimeString([], {
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          })}
+                        </span>
+                      </span>
+                      <ArrowUpRight size={16} />
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <div className="recent-empty">
+                  <span>
+                    <Grid2X2 size={18} /> A blank canvas, for now.
+                  </span>
+                  <p>Your recent creations will feel right at home here.</p>
+                  <span className="recent-empty-end">
+                    GO MAKE SOMETHING <ArrowUpRight size={13} />
+                  </span>
+                </div>
+              )}
+            </section>
+          )}
           <footer className="page-footer">
             <span>
-              <LockKeyhole size={12} /> Codes are processed locally. Shared links include your
-              content.
+              <LockKeyhole size={12} />{' '}
+              {mode === 'rfid'
+                ? 'Reader data stays in this session. Links include settings only.'
+                : 'Codes are processed locally. Shared links include your content.'}
             </span>
             <span>
               LESS FRICTION. MORE CONNECTION.<span className="footer-spark">✳</span>
@@ -1298,6 +1345,17 @@ function App() {
               The address bar keeps this workspace’s content, settings, and last generated code.
               Reload or copy the workspace link to reopen it. Links include your text; camera access
               and live generation never restart automatically.
+            </p>
+          </div>
+        </div>
+        <div className="guide-item">
+          <Usb size={21} />
+          <div>
+            <h3>Test an RFID reader</h3>
+            <p>
+              Open RFID lab for USB keyboard-style readers, raw HID reports, or USB serial ports.
+              Choose settings from your reader’s manual. Connections and received tag data are
+              session-only; shared links save the configuration.
             </p>
           </div>
         </div>
